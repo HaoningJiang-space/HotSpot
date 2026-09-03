@@ -8,26 +8,13 @@
 #include <strings.h>
 #endif
 #include <math.h>
-#include <time.h>
 
 #include "temperature_grid.h"
 
-#ifndef PCG_OBSERVATION
-#define PCG_OBSERVATION 0
-#endif
-
-#if PCG_OBSERVATION > 0
-#define PCG_REFERENCE_DELTA 1.0e-10
-#define PCG_REFERENCE_MAX_ITERATIONS 500000U
+#if SUPERLU < 1
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
-                                   grid_model_vector_t *temp,
-                                   const double *production,
-                                   unsigned int production_iterations,
-                                   double production_seconds,
-                                   const double *reference,
-                                   unsigned int reference_iterations,
-                                   double reference_seconds);
+                                   grid_model_vector_t *temp);
 #endif
 #include "flp.h"
 #include "util.h"
@@ -2388,7 +2375,7 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
                       csum += 1.0/(l[n].rx/2.0 + nr*model->pack.r_hs1_x); 
                       wsum += temp->extra[SINK_C_W]/(l[n].rx/2.0 + nr*model->pack.r_hs1_x); 
                   }
-              } else if ((n==subidx) && model->config.model_secondary) {
+              } else if (model->config.model_secondary && n==subidx) {
                   /* northern boundary - edge cell has half the ry	*/
                   if (i == 0) {
                       csum += 1.0/(l[n].ry/2.0 + nc*model->pack.r_sub1_y); 
@@ -2409,7 +2396,7 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
                       csum += 1.0/(l[n].rx/2.0 + nr*model->pack.r_sub1_x); 
                       wsum += temp->extra[SUB_W]/(l[n].rx/2.0 + nr*model->pack.r_sub1_x); 
                   } 
-              } else if ((n==solderidx) && model->config.model_secondary) {
+              } else if (model->config.model_secondary && n==solderidx) {
                   /* northern boundary - edge cell has half the ry	*/
                   if (i == 0) {
                       csum += 1.0/(l[n].ry/2.0 + nc*model->pack.r_solder1_y); 
@@ -2430,7 +2417,7 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
                       csum += 1.0/(l[n].rx/2.0 + nr*model->pack.r_solder1_x); 
                       wsum += temp->extra[SOLDER_W]/(l[n].rx/2.0 + nr*model->pack.r_solder1_x); 
                   } 
-              } else if ((n==pcbidx) && model->config.model_secondary) {
+              } else if (model->config.model_secondary && n==pcbidx) {
                   /* all nodes are connected to the ambient	*/
                   csum += 1.0/(model->config.r_convec_sec * 
                                (model->config.s_pcb * model->config.s_pcb) / (cw * ch));
@@ -2666,10 +2653,6 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
 {
   grid_model_vector_t *p;
   double total;
-  double delta;
-#if VERBOSE > 1
-  unsigned int i = 0;
-#endif
 
   if (!model->r_ready)
     fatal("R model not ready\n");
@@ -2695,63 +2678,7 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
    * state vector to store the grid temperatures
    */ 
   if(model->config.detailed_3D_used){
-      /* For detailed 3D, we do not use multi_grid */
-#if PCG_OBSERVATION > 0
-      {
-          int count = model->n_layers * model->rows * model->cols +
-            (model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA);
-          unsigned int production_iterations;
-          unsigned int reference_iterations = 0;
-          double production_seconds;
-          double *production = (double *)calloc(count, sizeof(double));
-          double *reference = (double *)calloc(count, sizeof(double));
-          clock_t reference_start;
-          if (!production || !reference)
-            fatal("memory allocation failed in PCG observation\n");
-          reference_start = clock();
-          set_heuristic_temp(model, p, model->last_steady);
-          do {
-              delta = single_iteration_steady_grid(model, p, model->last_steady);
-              reference_iterations++;
-              if (!isfinite(delta))
-                fatal("GS reference produced a non-finite update\n");
-              if (reference_iterations >= PCG_REFERENCE_MAX_ITERATIONS &&
-                  !eq(delta, 0))
-                fatal("production GS did not reach its stopping criterion\n");
-          } while (!eq(delta, 0));
-          production_seconds =
-            (double)(clock() - reference_start) / CLOCKS_PER_SEC;
-          production_iterations = reference_iterations;
-          copy_dvector(production, model->last_steady->cuboid[0][0], count);
-          while (delta > PCG_REFERENCE_DELTA) {
-              if (reference_iterations >= PCG_REFERENCE_MAX_ITERATIONS)
-                fatal("GS reference did not reach the accuracy target\n");
-              delta = single_iteration_steady_grid(model, p, model->last_steady);
-              reference_iterations++;
-              if (!isfinite(delta))
-                fatal("GS reference produced a non-finite update\n");
-          }
-          copy_dvector(reference, model->last_steady->cuboid[0][0], count);
-          jacobi_pcg_steady_grid(model, p, model->last_steady, production,
-              production_iterations, production_seconds, reference,
-              reference_iterations,
-              (double)(clock() - reference_start) / CLOCKS_PER_SEC);
-          free(production);
-          free(reference);
-      }
-#else
-      set_heuristic_temp(model, p, model->last_steady);
-      do {
-          delta = single_iteration_steady_grid(model, p, model->last_steady);
-#if VERBOSE > 1
-          i++;
-#endif
-      } while (!eq(delta, 0));
-#if VERBOSE > 1
-      fprintf(stdout, "no. of iterations for steady state convergence (%d x %d grid): %d\n", 
-              model->rows, model->cols, i);
-#endif
-#endif
+      jacobi_pcg_steady_grid(model, p, model->last_steady);
   }
   else{
       recursive_multigrid(model, p, model->last_steady);
@@ -3121,7 +3048,7 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
               /* western boundary	 - edge cell has half the rx	*/
               if (j == 0)
                 psum += (x[SINK_C_W] - A3D(v,n,i,j,nl,nr,nc))/(l[n].rx/2.0 + nr*model->pack.r_hs1_x); 
-          }	else if (n == pcbidx && model_secondary) {
+          }	else if (model_secondary && n == pcbidx) {
               /* all nodes are connected to the ambient	*/
               psum += (c->ambient - A3D(v,n,i,j,nl,nr,nc))/(model->config.r_convec_sec * 
                                                             (model->config.s_pcb * model->config.s_pcb) / (cw * ch));
@@ -3137,7 +3064,7 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
               /* western boundary	 - edge cell has half the rx	*/
               if (j == 0)
                 psum += (x[PCB_C_W] - A3D(v,n,i,j,nl,nr,nc))/(l[n].rx/2.0 + nr*model->pack.r_pcb1_x); 
-          }	else if (n == subidx && model_secondary) {
+          }	else if (model_secondary && n == subidx) {
               /* northern boundary - edge cell has half the ry	*/
               if (i == 0)
                 psum += (x[SUB_N] - A3D(v,n,i,j,nl,nr,nc))/(l[n].ry/2.0 + nc*model->pack.r_sub1_y); 
@@ -3150,7 +3077,7 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
               /* western boundary	 - edge cell has half the rx	*/
               if (j == 0)
                 psum += (x[SUB_W] - A3D(v,n,i,j,nl,nr,nc))/(l[n].rx/2.0 + nr*model->pack.r_sub1_x); 
-          }	else if (n == solderidx && model_secondary) {
+          }	else if (model_secondary && n == solderidx) {
               /* northern boundary - edge cell has half the ry	*/
               if (i == 0)
                 psum += (x[SOLDER_N] - A3D(v,n,i,j,nl,nr,nc))/(l[n].ry/2.0 + nc*model->pack.r_solder1_y); 
@@ -3175,12 +3102,11 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
   slope_fn_pack(model, v, p, dv);
 }
 
-#if PCG_OBSERVATION > 0
+#if SUPERLU < 1
 
 #define PCG_MAX_ITERATIONS 500
 #define PCG_RELATIVE_RESIDUAL 1.0e-10
 #define PCG_SYMMETRY_TOLERANCE 1.0e-10
-#define PCG_MAX_TEMPERATURE_ERROR 1.0e-4
 
 static double dot_product(const double *a, const double *b, int count)
 {
@@ -3384,61 +3310,17 @@ static void build_jacobi_diagonal(grid_model_t *model,
 
   for (k = 0; k < count; k++)
     if (!(diagonal[k] > 0.0) || !isfinite(diagonal[k]))
-      fatal("invalid Jacobi diagonal in PCG observation\n");
-}
-
-static void verify_steady_operator(grid_model_t *model,
-                                   grid_model_vector_t *power,
-                                   const double *cap, const double *rhs,
-                                   double *x, double *y,
-                                   double *ax, double *ay)
-{
-  int count = steady_node_count(model);
-  int i;
-  double asymmetry = maximum_grid_coupling_asymmetry(model);
-  double xay, yax, symmetry_error, xax, yay;
-
-  for (i = 0; i < count; i++) {
-    x[i] = ((i * 17) % 31 - 15) / 16.0;
-    y[i] = ((i * 29) % 37 - 18) / 19.0;
-  }
-  steady_matvec(model, power, cap, rhs, x, ax);
-  steady_matvec(model, power, cap, rhs, y, ay);
-  xay = dot_product(x, ay, count);
-  yax = dot_product(y, ax, count);
-  symmetry_error = relative_difference(xay, yax);
-  xax = dot_product(x, ax, count);
-  yay = dot_product(y, ay, count);
-  fprintf(stdout,
-          "PCG operator check: coupling_asymmetry=%.3e bilinear_asymmetry=%.3e xAx=%.9e yAy=%.9e\n",
-          asymmetry, symmetry_error, xax, yay);
-  if (asymmetry > PCG_SYMMETRY_TOLERANCE)
-    fatal("detailed-3D steady operator has asymmetric grid couplings\n");
-  if (symmetry_error > PCG_SYMMETRY_TOLERANCE ||
-      !(xax > 0.0) || !(yay > 0.0))
-    fatal("detailed-3D steady operator failed SPD observation\n");
+      fatal("invalid Jacobi diagonal in detailed-3D PCG solver\n");
 }
 
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
-                                   grid_model_vector_t *temp,
-                                   const double *production,
-                                   unsigned int production_iterations,
-                                   double production_seconds,
-                                   const double *reference,
-                                   unsigned int reference_iterations,
-                                   double reference_seconds)
+                                   grid_model_vector_t *temp)
 {
   int count = steady_node_count(model);
   int i, iteration;
-  double rhs_norm, residual_norm, production_residual_norm;
-  double reference_residual_norm;
+  double rhs_norm, residual_norm;
   double rho, next_rho, alpha, beta, pap;
-  double max_error = 0.0;
-  double production_error = 0.0;
-  double reference_peak = -LARGENUM;
-  double pcg_peak = -LARGENUM;
-  clock_t pcg_start = clock();
   double *cap = (double *)calloc(count, sizeof(double));
   double *rhs = (double *)calloc(count, sizeof(double));
   double *r = (double *)calloc(count, sizeof(double));
@@ -3447,7 +3329,6 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   double *product = (double *)calloc(count, sizeof(double));
   double *diagonal = (double *)calloc(count, sizeof(double));
   double *probe = (double *)calloc(count, sizeof(double));
-  double *probe_product = (double *)calloc(count, sizeof(double));
   double *x = temp->cuboid[0][0];
 
   /* Steady-only HotSpot normally leaves C uninitialized.  PCG does not use
@@ -3456,85 +3337,78 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   if (!model->c_ready)
     populate_C_model_grid(model, NULL);
   if (!cap || !rhs || !r || !z || !direction || !product || !diagonal ||
-      !probe || !probe_product)
-    fatal("memory allocation failed in PCG observation\n");
+      !probe)
+    fatal("memory allocation failed in detailed-3D PCG solver\n");
 
   build_capacitance_vector(model, cap);
   for (i = 0; i < count; i++)
     if (!(cap[i] > 0.0) || !isfinite(cap[i]))
-      fatal("invalid capacitance scaling in PCG observation\n");
+      fatal("invalid capacitance scaling in detailed-3D PCG solver\n");
+  if (maximum_grid_coupling_asymmetry(model) > PCG_SYMMETRY_TOLERANCE)
+    fatal("detailed-3D steady operator has asymmetric grid couplings\n");
   zero_dvector(probe, count);
   steady_residual(model, power, cap, probe, rhs);
-  verify_steady_operator(model, power, cap, rhs,
-                         direction, probe, product, probe_product);
   build_jacobi_diagonal(model, power, cap, rhs,
-                        diagonal, probe, probe_product);
+                        diagonal, direction, product);
 
   set_heuristic_temp(model, power, temp);
   steady_residual(model, power, cap, x, r);
   rhs_norm = sqrt(dot_product(rhs, rhs, count));
+  if (!(rhs_norm > 0.0) || !isfinite(rhs_norm))
+    fatal("invalid right-hand side in detailed-3D PCG solver\n");
   residual_norm = sqrt(dot_product(r, r, count));
-  for (i = 0; i < count; i++) {
-    z[i] = r[i] / diagonal[i];
-    direction[i] = z[i];
-  }
-  rho = dot_product(r, z, count);
-
-  for (iteration = 0;
-       iteration < PCG_MAX_ITERATIONS &&
-         residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm;
-       iteration++) {
-    steady_matvec(model, power, cap, rhs, direction, product);
-    pap = dot_product(direction, product, count);
-    if (!(pap > 0.0) || !isfinite(pap))
-      fatal("PCG observation encountered a non-positive direction\n");
-    alpha = rho / pap;
+  if (!isfinite(residual_norm))
+    fatal("invalid initial residual in detailed-3D PCG solver\n");
+  iteration = 0;
+  if (residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm) {
     for (i = 0; i < count; i++) {
-      x[i] += alpha * direction[i];
-      r[i] -= alpha * product[i];
-    }
-    residual_norm = sqrt(dot_product(r, r, count));
-    if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm) {
-      iteration++;
-      break;
-    }
-    for (i = 0; i < count; i++)
       z[i] = r[i] / diagonal[i];
-    next_rho = dot_product(r, z, count);
-    beta = next_rho / rho;
-    for (i = 0; i < count; i++)
-      direction[i] = z[i] + beta * direction[i];
-    rho = next_rho;
+      direction[i] = z[i];
+    }
+    rho = dot_product(r, z, count);
+    if (!(rho > 0.0) || !isfinite(rho))
+      fatal("invalid initial residual in detailed-3D PCG solver\n");
+
+    for (iteration = 0; iteration < PCG_MAX_ITERATIONS; iteration++) {
+      steady_matvec(model, power, cap, rhs, direction, product);
+      pap = dot_product(direction, product, count);
+      if (!(pap > 0.0) || !isfinite(pap))
+        fatal("detailed-3D PCG encountered a non-positive direction\n");
+      alpha = rho / pap;
+      for (i = 0; i < count; i++) {
+        x[i] += alpha * direction[i];
+        r[i] -= alpha * product[i];
+      }
+      residual_norm = sqrt(dot_product(r, r, count));
+      if (!isfinite(residual_norm))
+        fatal("invalid residual in detailed-3D PCG solver\n");
+      if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm) {
+        iteration++;
+        break;
+      }
+      for (i = 0; i < count; i++)
+        z[i] = r[i] / diagonal[i];
+      next_rho = dot_product(r, z, count);
+      if (!(next_rho > 0.0) || !isfinite(next_rho))
+        fatal("invalid residual in detailed-3D PCG solver\n");
+      beta = next_rho / rho;
+      for (i = 0; i < count; i++)
+        direction[i] = z[i] + beta * direction[i];
+      rho = next_rho;
+    }
   }
 
-  /* Report and gate on a freshly evaluated physical residual rather than the
-   * recursively updated Krylov vector, which can drift in finite precision. */
+  /* Gate on a freshly evaluated physical residual because the recursively
+   * updated Krylov vector can drift in finite precision. */
   steady_residual(model, power, cap, x, r);
   residual_norm = sqrt(dot_product(r, r, count));
-  steady_residual(model, power, cap, production, probe);
-  production_residual_norm = sqrt(dot_product(probe, probe, count));
-  steady_residual(model, power, cap, reference, probe_product);
-  reference_residual_norm = sqrt(dot_product(probe_product,
-                                             probe_product, count));
-  for (i = 0; i < count; i++) {
-    max_error = MAX(max_error, fabs(x[i] - reference[i]));
-    production_error = MAX(production_error, fabs(x[i] - production[i]));
-    reference_peak = MAX(reference_peak, reference[i]);
-    pcg_peak = MAX(pcg_peak, x[i]);
-  }
-  fprintf(stdout, "PCG convergence: iterations=%d relative_residual=%.9e\n",
-          iteration, residual_norm / rhs_norm);
-  fprintf(stdout,
-          "PCG comparison: production_gs_iterations=%u production_gs_relative_residual=%.9e production_gs_seconds=%.6f production_temperature_error=%.9e reference_gs_iterations=%u reference_gs_relative_residual=%.9e reference_gs_seconds=%.6f pcg_seconds=%.6f max_temperature_error=%.9e peak_temperature_error=%.9e\n",
-          production_iterations, production_residual_norm / rhs_norm,
-          production_seconds, production_error, reference_iterations,
-          reference_residual_norm / rhs_norm, reference_seconds,
-          (double)(clock() - pcg_start) / CLOCKS_PER_SEC, max_error,
-          fabs(pcg_peak - reference_peak));
-  if (max_error > PCG_MAX_TEMPERATURE_ERROR)
-    fatal("PCG observation exceeds the temperature-error limit\n");
-  if (residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm)
-    fatal("PCG observation did not converge within 500 iterations\n");
+  if (!isfinite(residual_norm) ||
+      residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm)
+    fatal("detailed-3D PCG did not converge within 500 iterations\n");
+#if VERBOSE > 1
+  fprintf(stdout, "no. of iterations for steady state convergence (%d x %d grid): %d\n",
+          model->rows, model->cols, iteration);
+#endif
 
   free(cap);
   free(rhs);
@@ -3544,7 +3418,6 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   free(product);
   free(diagonal);
   free(probe);
-  free(probe_product);
 }
 
 #endif
