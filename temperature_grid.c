@@ -66,6 +66,48 @@ double find_cap_3D(int n, int i, int j, grid_model_t *model)
   }
 }//end->BU_3D
 
+enum {
+  CONDUCTANCE_NORTH,
+  CONDUCTANCE_SOUTH,
+  CONDUCTANCE_EAST,
+  CONDUCTANCE_WEST,
+  CONDUCTANCE_ABOVE,
+  CONDUCTANCE_BELOW,
+  CONDUCTANCE_COUNT
+};
+
+#define STEADY_CONDUCTANCE(model, n, i, j, direction) \
+  ((model)->steady_conductance[((((n) * (model)->rows + (i)) * \
+                                 (model)->cols + (j)) * CONDUCTANCE_COUNT) + \
+                               (direction)])
+
+static void populate_steady_conductance(grid_model_t *model)
+{
+  int n, i, j;
+  int nl = model->n_layers;
+  int nr = model->rows;
+  int nc = model->cols;
+
+  free_dvector(model->steady_conductance);
+  model->steady_conductance = dvector(nl * nr * nc * CONDUCTANCE_COUNT);
+  for (n = 0; n < nl; n++)
+    for (i = 0; i < nr; i++)
+      for (j = 0; j < nc; j++) {
+        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH) =
+          (i > 0) ? 1.0 / find_res_3D(n, i-1, j, model, 2) : 0.0;
+        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH) =
+          (i < nr-1) ? 1.0 / find_res_3D(n, i+1, j, model, 2) : 0.0;
+        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST) =
+          (j < nc-1) ? 1.0 / find_res_3D(n, i, j+1, model, 1) : 0.0;
+        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST) =
+          (j > 0) ? 1.0 / find_res_3D(n, i, j-1, model, 1) : 0.0;
+        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE) =
+          (n > 0) ? 1.0 / find_res_3D(n-1, i, j, model, 3) : 0.0;
+        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW) =
+          (n < nl-1) ? 1.0 / find_res_3D(n, i, j, model, 3) : 0.0;
+      }
+}
+
 /* constructors	*/
 /*BU_3D: 
  * - Added parameter do_detailed_3D to this function
@@ -841,6 +883,8 @@ void populate_R_model_grid(grid_model_t *model, flp_t *flp)
   }
 
   /* done	*/
+  if (model->config.detailed_3D_used)
+    populate_steady_conductance(model);
   model->r_ready = TRUE;
 }
 
@@ -950,6 +994,7 @@ void delete_grid_model(grid_model_t *model)
 
   free_grid_model_vector(model->last_steady);
   free_grid_model_vector(model->last_trans);
+  free_dvector(model->steady_conductance);
   free(model->layers);
   free(model);
 }
@@ -2213,37 +2258,6 @@ double single_iteration_steady_pack(grid_model_t *model, grid_model_vector_t *po
 /* weighted T of the next cell above. zero if on top face			*/
 # define AT(l,v,n,i,j,nl,nr,nc)		((n > 0) ? (v[n-1][i][j]/l[n-1].rz) : 0.0)
 
-//BU_3D: These are the same macros as above except that they have to check
-//for a resistivity value first since the detailed 3D  model is not uniform across the layer
-/* macros for calculating conductances	*/
-/* conductance to the next cell north. zero if on northern boundary	*/
-# define NC_det3D(l,n,i,j,nl,nr,nc)		((i > 0) ? (1.0/find_res_3D(n, i-1, j, model,2)) : 0.0)
-/* conductance to the next cell south. zero if on southern boundary	*/
-# define SC_det3D(l,n,i,j,nl,nr,nc)		((i < nr-1) ? (1.0/find_res_3D(n, i+1, j, model,2)) : 0.0)
-/* conductance to the next cell east. zero if on eastern boundary	*/
-# define EC_det3D(l,n,i,j,nl,nr,nc)		((j < nc-1) ? (1.0/find_res_3D(n, i, j+1, model,1)) : 0.0)
-/* conductance to the next cell west. zero if on western boundary	*/
-# define WC_det3D(l,n,i,j,nl,nr,nc)		((j > 0) ? (1.0/find_res_3D(n, i, j-1, model,1)) : 0.0)
-/* conductance to the next cell below. zero if on bottom face		*/
-# define BC_det3D(l,n,i,j,nl,nr,nc)		((n < nl-1) ? (1.0/find_res_3D(n, i, j, model,3)) : 0.0)
-/* conductance to the next cell above. zero if on top face			*/
-# define AC_det3D(l,n,i,j,nl,nr,nc)		((n > 0) ? (1.0/find_res_3D(n-1, i, j, model,3)) : 0.0)
-
-/* macros for calculating weighted temperatures	*/
-/* weighted T of the next cell north. zero if on northern boundary	*/
-# define NT_det3D(l,v,n,i,j,nl,nr,nc)		((i > 0) ? (v[n][i-1][j]/find_res_3D(n, i-1, j, model,2)) : 0.0)
-/* weighted T of the next cell south. zero if on southern boundary	*/
-# define ST_det3D(l,v,n,i,j,nl,nr,nc)		((i < nr-1) ? (v[n][i+1][j]/find_res_3D(n, i+1, j, model,2)) : 0.0)
-/* weighted T of the next cell east. zero if on eastern boundary	*/
-# define ET_det3D(l,v,n,i,j,nl,nr,nc)		((j < nc-1) ? (v[n][i][j+1]/find_res_3D(n, i, j+1, model,1)) : 0.0)
-/* weighted T of the next cell west. zero if on western boundary	*/
-# define WT_det3D(l,v,n,i,j,nl,nr,nc)		((j > 0) ? (v[n][i][j-1]/find_res_3D(n, i, j-1, model,1)) : 0.0)
-/* weighted T of the next cell below. zero if on bottom face		*/
-# define BT_det3D(l,v,n,i,j,nl,nr,nc)		((n < nl-1) ? (v[n+1][i][j]/find_res_3D(n, i, j, model,3)) : 0.0)
-/* weighted T of the next cell above. zero if on top face			*/
-# define AT_det3D(l,v,n,i,j,nl,nr,nc)		((n > 0) ? (v[n-1][i][j]/find_res_3D(n-1, i, j, model,3)) : 0.0)
-//end->BU_3D
-
 /* single steady state iteration of grid solver - silicon part */
 double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *power,
                                     grid_model_vector_t *temp)
@@ -2254,6 +2268,7 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
   double csum;
   /* weighted sum of temperatures	*/
   double wsum;
+  double north, south, east, west, above, below;
 
   /* shortcuts for cell width(cw) and cell height(ch)	*/
   double cw = model->width / model->cols;
@@ -2286,15 +2301,23 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
                */
               // BU_3D: call new macros if detailed_3D model is used 
               // the spreader/heat sink layers will use uniform R
-              if(model->config.detailed_3D_used == 1){
-                  csum = NC_det3D(l,n,i,j,nl,nr,nc) + SC_det3D(l,n,i,j,nl,nr,nc) + 
-                    EC_det3D(l,n,i,j,nl,nr,nc) + WC_det3D(l,n,i,j,nl,nr,nc) + 
-                    AC_det3D(l,n,i,j,nl,nr,nc) + BC_det3D(l,n,i,j,nl,nr,nc);
+              if(model->config.detailed_3D_used){
+                  north = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH);
+                  south = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH);
+                  east = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST);
+                  west = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST);
+                  above = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE);
+                  below = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
 
-                  /* sum of the weighted temperatures of all the neighbours*/	
-                  wsum = NT_det3D(l,v,n,i,j,nl,nr,nc) + ST_det3D(l,v,n,i,j,nl,nr,nc) + 
-                    ET_det3D(l,v,n,i,j,nl,nr,nc) + WT_det3D(l,v,n,i,j,nl,nr,nc) + 
-                    AT_det3D(l,v,n,i,j,nl,nr,nc) + BT_det3D(l,v,n,i,j,nl,nr,nc);
+                  csum = north + south + east + west + above + below;
+
+                  /* sum of the weighted temperatures of all the neighbours */
+                  wsum = ((i > 0) ? v[n][i-1][j] * north : 0.0) +
+                    ((i < nr-1) ? v[n][i+1][j] * south : 0.0) +
+                    ((j < nc-1) ? v[n][i][j+1] * east : 0.0) +
+                    ((j > 0) ? v[n][i][j-1] * west : 0.0) +
+                    ((n > 0) ? v[n-1][i][j] * above : 0.0) +
+                    ((n < nl-1) ? v[n+1][i][j] * below : 0.0);
               } //end->BU_3D
               else {	
                   csum = NC(l,n,i,j,nl,nr,nc) + SC(l,n,i,j,nl,nr,nc) + 
