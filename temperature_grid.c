@@ -17,9 +17,13 @@
 #endif
 
 #if PCG_OBSERVATION > 0
+#define PCG_REFERENCE_DELTA 1.0e-10
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
                                    grid_model_vector_t *temp,
+                                   const double *production,
+                                   unsigned int production_iterations,
+                                   double production_seconds,
                                    const double *reference,
                                    unsigned int reference_iterations,
                                    double reference_seconds);
@@ -2695,10 +2699,13 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
       {
           int count = model->n_layers * model->rows * model->cols +
             (model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA);
+          unsigned int production_iterations;
           unsigned int reference_iterations = 0;
+          double production_seconds;
+          double *production = (double *)calloc(count, sizeof(double));
           double *reference = (double *)calloc(count, sizeof(double));
           clock_t reference_start;
-          if (!reference)
+          if (!production || !reference)
             fatal("memory allocation failed in PCG observation\n");
           reference_start = clock();
           set_heuristic_temp(model, p, model->last_steady);
@@ -2706,10 +2713,20 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
               delta = single_iteration_steady_grid(model, p, model->last_steady);
               reference_iterations++;
           } while (!eq(delta, 0));
+          production_seconds =
+            (double)(clock() - reference_start) / CLOCKS_PER_SEC;
+          production_iterations = reference_iterations;
+          copy_dvector(production, model->last_steady->cuboid[0][0], count);
+          do {
+              delta = single_iteration_steady_grid(model, p, model->last_steady);
+              reference_iterations++;
+          } while (delta > PCG_REFERENCE_DELTA);
           copy_dvector(reference, model->last_steady->cuboid[0][0], count);
-          jacobi_pcg_steady_grid(model, p, model->last_steady, reference,
+          jacobi_pcg_steady_grid(model, p, model->last_steady, production,
+              production_iterations, production_seconds, reference,
               reference_iterations,
               (double)(clock() - reference_start) / CLOCKS_PER_SEC);
+          free(production);
           free(reference);
       }
 #else
@@ -3395,15 +3412,20 @@ static void verify_steady_operator(grid_model_t *model,
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
                                    grid_model_vector_t *temp,
+                                   const double *production,
+                                   unsigned int production_iterations,
+                                   double production_seconds,
                                    const double *reference,
                                    unsigned int reference_iterations,
                                    double reference_seconds)
 {
   int count = steady_node_count(model);
   int i, iteration;
-  double rhs_norm, residual_norm, reference_residual_norm;
+  double rhs_norm, residual_norm, production_residual_norm;
+  double reference_residual_norm;
   double rho, next_rho, alpha, beta, pap;
   double max_error = 0.0;
+  double production_error = 0.0;
   double reference_peak = -LARGENUM;
   double pcg_peak = -LARGENUM;
   clock_t pcg_start = clock();
@@ -3479,21 +3501,26 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
    * recursively updated Krylov vector, which can drift in finite precision. */
   steady_residual(model, power, cap, x, r);
   residual_norm = sqrt(dot_product(r, r, count));
+  steady_residual(model, power, cap, production, probe);
+  production_residual_norm = sqrt(dot_product(probe, probe, count));
   steady_residual(model, power, cap, reference, probe_product);
   reference_residual_norm = sqrt(dot_product(probe_product,
                                              probe_product, count));
   for (i = 0; i < count; i++) {
     max_error = MAX(max_error, fabs(x[i] - reference[i]));
+    production_error = MAX(production_error, fabs(x[i] - production[i]));
     reference_peak = MAX(reference_peak, reference[i]);
     pcg_peak = MAX(pcg_peak, x[i]);
   }
   fprintf(stdout, "PCG convergence: iterations=%d relative_residual=%.9e\n",
           iteration, residual_norm / rhs_norm);
   fprintf(stdout,
-          "PCG comparison: gs_iterations=%u gs_relative_residual=%.9e gs_seconds=%.6f pcg_seconds=%.6f max_temperature_error=%.9e peak_temperature_error=%.9e\n",
-          reference_iterations, reference_residual_norm / rhs_norm,
-          reference_seconds, (double)(clock() - pcg_start) / CLOCKS_PER_SEC,
-          max_error, fabs(pcg_peak - reference_peak));
+          "PCG comparison: production_gs_iterations=%u production_gs_relative_residual=%.9e production_gs_seconds=%.6f production_temperature_error=%.9e reference_gs_iterations=%u reference_gs_relative_residual=%.9e reference_gs_seconds=%.6f pcg_seconds=%.6f max_temperature_error=%.9e peak_temperature_error=%.9e\n",
+          production_iterations, production_residual_norm / rhs_norm,
+          production_seconds, production_error, reference_iterations,
+          reference_residual_norm / rhs_norm, reference_seconds,
+          (double)(clock() - pcg_start) / CLOCKS_PER_SEC, max_error,
+          fabs(pcg_peak - reference_peak));
   if (max_error > PCG_MAX_TEMPERATURE_ERROR)
     fatal("PCG observation exceeds the temperature-error limit\n");
   if (residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm)
