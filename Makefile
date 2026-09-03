@@ -131,6 +131,10 @@ endif
 
 CFLAGS	= $(OFLAGS) $(EXTRAFLAGS) $(INCDIRFLAG) $(LIBDIRFLAG) -DVERBOSE=$(VERBOSE) -DMATHACCEL=$(ACCELNUM) -DDEBUG3D=$(DEBUG3D) -DSUPERLU=$(SUPERLU) -g
 
+# Observation-only alternative for the detailed-3D steady-state solver.
+PCG_OBSERVATION ?= 0
+CFLAGS += -DPCG_OBSERVATION=$(PCG_OBSERVATION)
+
 # sources, objects, headers and inputs
 
 # HotFloorplan
@@ -219,4 +223,3 @@ clean:
 
 cleano:
 	$(RM) *.$(OEXT) *.obj
-
