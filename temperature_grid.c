@@ -18,6 +18,7 @@
 
 #if PCG_OBSERVATION > 0
 #define PCG_REFERENCE_DELTA 1.0e-10
+#define PCG_REFERENCE_MAX_ITERATIONS 500000U
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
                                    grid_model_vector_t *temp,
@@ -2712,15 +2713,24 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
           do {
               delta = single_iteration_steady_grid(model, p, model->last_steady);
               reference_iterations++;
+              if (!isfinite(delta))
+                fatal("GS reference produced a non-finite update\n");
+              if (reference_iterations >= PCG_REFERENCE_MAX_ITERATIONS &&
+                  !eq(delta, 0))
+                fatal("production GS did not reach its stopping criterion\n");
           } while (!eq(delta, 0));
           production_seconds =
             (double)(clock() - reference_start) / CLOCKS_PER_SEC;
           production_iterations = reference_iterations;
           copy_dvector(production, model->last_steady->cuboid[0][0], count);
-          do {
+          while (delta > PCG_REFERENCE_DELTA) {
+              if (reference_iterations >= PCG_REFERENCE_MAX_ITERATIONS)
+                fatal("GS reference did not reach the accuracy target\n");
               delta = single_iteration_steady_grid(model, p, model->last_steady);
               reference_iterations++;
-          } while (delta > PCG_REFERENCE_DELTA);
+              if (!isfinite(delta))
+                fatal("GS reference produced a non-finite update\n");
+          }
           copy_dvector(reference, model->last_steady->cuboid[0][0], count);
           jacobi_pcg_steady_grid(model, p, model->last_steady, production,
               production_iterations, production_seconds, reference,
