@@ -3153,6 +3153,7 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
 #define PCG_MAX_ITERATIONS 500
 #define PCG_RELATIVE_RESIDUAL 1.0e-10
 #define PCG_SYMMETRY_TOLERANCE 1.0e-10
+#define PCG_MAX_TEMPERATURE_ERROR 1.0e-4
 
 static double dot_product(const double *a, const double *b, int count)
 {
@@ -3493,6 +3494,8 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
           reference_iterations, reference_residual_norm / rhs_norm,
           reference_seconds, (double)(clock() - pcg_start) / CLOCKS_PER_SEC,
           max_error, fabs(pcg_peak - reference_peak));
+  if (max_error > PCG_MAX_TEMPERATURE_ERROR)
+    fatal("PCG observation exceeds the temperature-error limit\n");
   if (residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm)
     fatal("PCG observation did not converge within 500 iterations\n");
 
