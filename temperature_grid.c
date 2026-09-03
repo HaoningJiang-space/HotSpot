@@ -73,6 +73,7 @@ enum {
   CONDUCTANCE_WEST,
   CONDUCTANCE_ABOVE,
   CONDUCTANCE_BELOW,
+  CONDUCTANCE_DIAGONAL,
   CONDUCTANCE_COUNT
 };
 
@@ -87,6 +88,15 @@ static void populate_steady_conductance(grid_model_t *model)
   int nl = model->n_layers;
   int nr = model->rows;
   int nc = model->cols;
+  int spidx = nl - DEFAULT_PACK_LAYERS + LAYER_SP;
+  int hsidx = nl - DEFAULT_PACK_LAYERS + LAYER_SINK;
+  int subidx = LAYER_SUB;
+  int solderidx = LAYER_SOLDER;
+  int pcbidx = LAYER_PCB;
+  double cw = model->width / nc;
+  double ch = model->height / nr;
+  double diagonal;
+  layer_t *layers = model->layers;
 
   free_dvector(model->steady_conductance);
   model->steady_conductance = dvector(nl * nr * nc * CONDUCTANCE_COUNT);
@@ -105,6 +115,66 @@ static void populate_steady_conductance(grid_model_t *model)
           (n > 0) ? 1.0 / find_res_3D(n-1, i, j, model, 3) : 0.0;
         STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW) =
           (n < nl-1) ? 1.0 / find_res_3D(n, i, j, model, 3) : 0.0;
+
+        diagonal =
+          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH) +
+          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH) +
+          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST) +
+          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST) +
+          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE) +
+          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
+
+        if (n == spidx) {
+          if (i == 0)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_sp1_y);
+          if (i == nr-1)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_sp1_y);
+          if (j == nc-1)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_sp1_x);
+          if (j == 0)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_sp1_x);
+        } else if (n == hsidx) {
+          diagonal += 1.0 / layers[n].rz;
+          if (i == 0)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_hs1_y);
+          if (i == nr-1)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_hs1_y);
+          if (j == nc-1)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_hs1_x);
+          if (j == 0)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_hs1_x);
+        } else if (model->config.model_secondary && n == subidx) {
+          if (i == 0)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_sub1_y);
+          if (i == nr-1)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_sub1_y);
+          if (j == nc-1)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_sub1_x);
+          if (j == 0)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_sub1_x);
+        } else if (model->config.model_secondary && n == solderidx) {
+          if (i == 0)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_solder1_y);
+          if (i == nr-1)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_solder1_y);
+          if (j == nc-1)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_solder1_x);
+          if (j == 0)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_solder1_x);
+        } else if (model->config.model_secondary && n == pcbidx) {
+          diagonal += 1.0 / (model->config.r_convec_sec *
+                             (model->config.s_pcb * model->config.s_pcb) /
+                             (cw * ch));
+          if (i == 0)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_pcb1_y);
+          if (i == nr-1)
+            diagonal += 1.0 / (layers[n].ry / 2.0 + nc * model->pack.r_pcb1_y);
+          if (j == nc-1)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_pcb1_x);
+          if (j == 0)
+            diagonal += 1.0 / (layers[n].rx / 2.0 + nr * model->pack.r_pcb1_x);
+        }
+        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_DIAGONAL) = diagonal;
       }
 }
 
@@ -1944,16 +2014,12 @@ double single_iteration_steady_pack(grid_model_t *model, grid_model_vector_t *po
   int nl = model->n_layers;
   int nr = model->rows;
   int nc = model->cols;
-  int spidx, hsidx, subidx, solderidx, pcbidx;
-  int model_secondary = model->config.model_secondary;
-
+  int spidx, hsidx;
+  int subidx = LAYER_SUB;
+  int solderidx = LAYER_SOLDER;
+  int pcbidx = LAYER_PCB;
   spidx = nl - DEFAULT_PACK_LAYERS + LAYER_SP;
   hsidx = nl - DEFAULT_PACK_LAYERS + LAYER_SINK;
-  if (model_secondary) {
-      subidx = LAYER_SUB;
-      solderidx = LAYER_SOLDER;
-      pcbidx = LAYER_PCB;	
-  }
 
   /* sink outer north/south	*/
   csum = 1.0/(pk->r_hs_per + pk->r_amb_per) + 1.0/(pk->r_hs2_y + pk->r_hs);
@@ -2281,16 +2347,12 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
   int nl = model->n_layers;
   int nr = model->rows;
   int nc = model->cols;
-  int spidx, hsidx, subidx, solderidx, pcbidx;
-  int model_secondary = model->config.model_secondary;
-
+  int spidx, hsidx;
+  int subidx = LAYER_SUB;
+  int solderidx = LAYER_SOLDER;
+  int pcbidx = LAYER_PCB;
   spidx = nl - DEFAULT_PACK_LAYERS + LAYER_SP;
   hsidx = nl - DEFAULT_PACK_LAYERS + LAYER_SINK;
-  if (model_secondary) {
-      subidx = LAYER_SUB;
-      solderidx = LAYER_SOLDER;
-      pcbidx = LAYER_PCB;	
-  }
 
   /* for each grid cell	*/
   for(n=0; n < nl; n++) {
@@ -2309,7 +2371,8 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
                   above = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE);
                   below = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
 
-                  csum = north + south + east + west + above + below;
+                  csum = STEADY_CONDUCTANCE(model, n, i, j,
+                                            CONDUCTANCE_DIAGONAL);
 
                   /* sum of the weighted temperatures of all the neighbours */
                   wsum = ((i > 0) ? v[n][i-1][j] * north : 0.0) +
@@ -2446,6 +2509,11 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
                       wsum += temp->extra[PCB_C_W]/(l[n].rx/2.0 + nr*model->pack.r_pcb1_x); 
                   }
               }
+
+              /* The shared package path above preserves non-detailed arithmetic. */
+              if (model->config.detailed_3D_used)
+                  csum = STEADY_CONDUCTANCE(model, n, i, j,
+                                            CONDUCTANCE_DIAGONAL);
 
               /* update the current cell's temperature	*/	   
               prev = v[n][i][j];

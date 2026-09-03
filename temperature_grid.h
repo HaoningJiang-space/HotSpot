@@ -159,7 +159,7 @@ typedef struct grid_model_t_st
   int c_ready;	/* are the C's initialized?	*/
   int has_lcf;	/* LCF file specified?		*/
 
-  /* six neighbor conductances per detailed-3D grid cell */
+  /* six neighbor conductances and their diagonal sum per detailed-3D cell */
   double *steady_conductance;
 
   /* internal state - most recently computed
