@@ -3104,7 +3104,7 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
 
 #if SUPERLU < 1
 
-#define PCG_MAX_ITERATIONS 500
+#define PCG_MAX_ITERATIONS 5000
 #define PCG_RELATIVE_RESIDUAL 1.0e-10
 #define PCG_SYMMETRY_TOLERANCE 1.0e-10
 
@@ -3319,6 +3319,8 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
 {
   int count = steady_node_count(model);
   int i, iteration;
+  int recursive_converged = 0;
+  const char *termination_status;
   double rhs_norm, residual_norm;
   double rho, next_rho, alpha, beta, pap;
   double *cap = (double *)calloc(count, sizeof(double));
@@ -3360,7 +3362,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   if (!isfinite(residual_norm))
     fatal("invalid initial residual in detailed-3D PCG solver\n");
   iteration = 0;
-  if (residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm) {
+  if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm) {
+    recursive_converged = 1;
+  } else {
     for (i = 0; i < count; i++) {
       z[i] = r[i] / diagonal[i];
       direction[i] = z[i];
@@ -3383,6 +3387,7 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
       if (!isfinite(residual_norm))
         fatal("invalid residual in detailed-3D PCG solver\n");
       if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm) {
+        recursive_converged = 1;
         iteration++;
         break;
       }
@@ -3402,13 +3407,25 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
    * updated Krylov vector can drift in finite precision. */
   steady_residual(model, power, cap, x, r);
   residual_norm = sqrt(dot_product(r, r, count));
-  if (!isfinite(residual_norm) ||
-      residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm)
-    fatal("detailed-3D PCG did not converge within 500 iterations\n");
-#if VERBOSE > 1
-  fprintf(stdout, "no. of iterations for steady state convergence (%d x %d grid): %d\n",
-          model->rows, model->cols, iteration);
+  if (!isfinite(residual_norm))
+    fatal("invalid final physical residual in detailed-3D PCG solver\n");
+  if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm)
+    termination_status = "converged";
+  else if (recursive_converged)
+    termination_status = "physical_validation_failed";
+  else
+    termination_status = "iteration_limit";
+#if VERBOSE > 0
+  fprintf(stdout,
+          "detailed-3D PCG termination: status=%s iterations=%d limit=%d relative_residual=%.9e\n",
+          termination_status, iteration, PCG_MAX_ITERATIONS,
+          residual_norm / rhs_norm);
 #endif
+  if (residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm) {
+    if (recursive_converged)
+      fatal("detailed-3D PCG recursive residual failed physical validation\n");
+    fatal("detailed-3D PCG reached its iteration limit\n");
+  }
 
   free(cap);
   free(rhs);
