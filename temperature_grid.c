@@ -1155,11 +1155,57 @@ void dump_top_layer_temp_grid (grid_model_t *model, char *file, grid_model_vecto
     fclose(fp);	
 }
 
-/* dump the steady state grid temperatures of the top layer onto 'file'	*/
+/* dump the steady state grid temperatures of every user-defined LCF layer */
 void dump_steady_temp_grid (grid_model_t *model, char *file)
 {
-  /* top layer of the most-recently computed steady state temperature	*/
-  dump_top_layer_temp_grid(model, file, model->last_steady);
+  int i, j, n;
+  int first_layer, output_layers;
+  char str[STR_SIZE];
+  FILE *fp;
+
+  /* Preserve HotSpot 6.0's single-plane interface when no layer file is
+   * supplied.  ThermoDSE always supplies an LCF and needs every LCF plane,
+   * but not HotSpot's internally appended spreader and heatsink planes. */
+  if (!model->has_lcf) {
+    dump_top_layer_temp_grid(model, file, model->last_steady);
+    return;
+  }
+
+  if (!model->r_ready)
+    fatal("R model not ready\n");
+
+  if (model->config.model_secondary) {
+    first_layer = SEC_PACK_LAYERS;
+    output_layers = model->n_layers - DEFAULT_PACK_LAYERS - SEC_PACK_LAYERS;
+  } else {
+    first_layer = 0;
+    output_layers = model->n_layers - DEFAULT_PACK_LAYERS;
+  }
+
+  if (!strcasecmp(file, "stdout"))
+    fp = stdout;
+  else if (!strcasecmp(file, "stderr"))
+    fp = stderr;
+  else
+    fp = fopen(file, "w");
+
+  if (!fp) {
+    sprintf(str, "error: %s could not be opened for writing\n", file);
+    fatal(str);
+  }
+
+  for(n=0; n < output_layers; n++) {
+    fprintf(fp, "Layer %d:\n", n);
+    for(i=0; i < model->rows; i++) {
+      for(j=0; j < model->cols; j++) {
+        fprintf(fp, "%d\t%.2f\n", i*model->cols+j,
+                model->last_steady->cuboid[first_layer+n][i][j]);
+      }
+    }
+  }
+
+  if(fp != stdout && fp != stderr)
+    fclose(fp);
 }
 
 /* dump temperature vector alloced using 'hotspot_vector' to 'file' */ 
