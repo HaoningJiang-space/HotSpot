@@ -3319,7 +3319,7 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
 {
   int count = steady_node_count(model);
   int i, iteration;
-  int recursive_converged = 0;
+  int converged = 0;
   const char *termination_status;
   double rhs_norm, residual_norm;
   double rho, next_rho, alpha, beta, pap;
@@ -3363,7 +3363,7 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
     fatal("invalid initial residual in detailed-3D PCG solver\n");
   iteration = 0;
   if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm) {
-    recursive_converged = 1;
+    converged = 1;
   } else {
     for (i = 0; i < count; i++) {
       z[i] = r[i] / diagonal[i];
@@ -3387,9 +3387,27 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
       if (!isfinite(residual_norm))
         fatal("invalid residual in detailed-3D PCG solver\n");
       if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm) {
-        recursive_converged = 1;
-        iteration++;
-        break;
+        /* Validate apparent convergence with the physical residual.  If the
+         * recursively updated residual has drifted, replace it and restart
+         * the Krylov direction instead of accepting or rejecting the same
+         * otherwise valid iterate. */
+        steady_residual(model, power, cap, x, r);
+        residual_norm = sqrt(dot_product(r, r, count));
+        if (!isfinite(residual_norm))
+          fatal("invalid physical residual in detailed-3D PCG solver\n");
+        if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm) {
+          converged = 1;
+          iteration++;
+          break;
+        }
+        for (i = 0; i < count; i++) {
+          z[i] = r[i] / diagonal[i];
+          direction[i] = z[i];
+        }
+        rho = dot_product(r, z, count);
+        if (!(rho > 0.0) || !isfinite(rho))
+          fatal("invalid physical residual in detailed-3D PCG solver\n");
+        continue;
       }
       for (i = 0; i < count; i++)
         z[i] = r[i] / diagonal[i];
@@ -3403,29 +3421,22 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
     }
   }
 
-  /* Gate on a freshly evaluated physical residual because the recursively
-   * updated Krylov vector can drift in finite precision. */
-  steady_residual(model, power, cap, x, r);
-  residual_norm = sqrt(dot_product(r, r, count));
-  if (!isfinite(residual_norm))
-    fatal("invalid final physical residual in detailed-3D PCG solver\n");
-  if (residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm)
-    termination_status = "converged";
-  else if (recursive_converged)
-    termination_status = "physical_validation_failed";
-  else
-    termination_status = "iteration_limit";
+  if (!converged) {
+    steady_residual(model, power, cap, x, r);
+    residual_norm = sqrt(dot_product(r, r, count));
+    if (!isfinite(residual_norm))
+      fatal("invalid final physical residual in detailed-3D PCG solver\n");
+    converged = residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm;
+  }
+  termination_status = converged ? "converged" : "iteration_limit";
 #if VERBOSE > 0
   fprintf(stdout,
           "detailed-3D PCG termination: status=%s iterations=%d limit=%d relative_residual=%.9e\n",
           termination_status, iteration, PCG_MAX_ITERATIONS,
           residual_norm / rhs_norm);
 #endif
-  if (residual_norm > PCG_RELATIVE_RESIDUAL * rhs_norm) {
-    if (recursive_converged)
-      fatal("detailed-3D PCG recursive residual failed physical validation\n");
+  if (!converged)
     fatal("detailed-3D PCG reached its iteration limit\n");
-  }
 
   free(cap);
   free(rhs);
