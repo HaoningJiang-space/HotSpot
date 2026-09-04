@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #ifdef _MSC_VER
 #define strcasecmp    _stricmp
 #define strncasecmp   _strnicmp
@@ -10,6 +11,10 @@
 #include <math.h>
 
 #include "temperature_grid.h"
+
+#ifndef GATE_GS0
+#define GATE_GS0 0
+#endif
 
 #if SUPERLU < 1
 static void jacobi_pcg_steady_grid(grid_model_t *model,
@@ -2695,7 +2700,8 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
 #define A3D(array,n,i,j,nl,nr,nc)		(array[(n)*(nr)*(nc) + (i)*(nc) + (j)])
 
 /* compute the slope vector for the package nodes	*/
-void slope_fn_pack(grid_model_t *model, double *v, grid_model_vector_t *p, double *dv)
+void slope_fn_pack(grid_model_t *model, const double *v,
+                   grid_model_vector_t *p, double *dv)
 {
   int i, j;
   /* sum of the currents(power values)	*/
@@ -2712,7 +2718,7 @@ void slope_fn_pack(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
   int model_secondary = model->config.model_secondary;
 
   /* pointer to the starting address of the extra nodes	*/
-  double *x = v + nl*nr*nc;
+  const double *x = v + nl*nr*nc;
 
   spidx = nl - DEFAULT_PACK_LAYERS + LAYER_SP;
   hsidx = nl - DEFAULT_PACK_LAYERS + LAYER_SINK;
@@ -2968,7 +2974,8 @@ void slope_fn_pack(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
  * equation is CdV + sum{(T - Ti)/Ri} = P 
  * so, slope = dV = [P + sum{(Ti-T)/Ri}]/C
  */
-void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, double *dv)
+void slope_fn_grid(grid_model_t *model, const double *v,
+                   grid_model_vector_t *p, double *dv)
 {
   int n, i, j;
   /* sum of the currents(power values)	*/
@@ -2988,7 +2995,7 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
   int model_secondary = model->config.model_secondary;
 
   /* pointer to the starting address of the extra nodes	*/
-  double *x = v + nl*nr*nc;
+  const double *x = v + nl*nr*nc;
 
   spidx = nl - DEFAULT_PACK_LAYERS + LAYER_SP;
   hsidx = nl - DEFAULT_PACK_LAYERS + LAYER_SINK;
@@ -3102,6 +3109,184 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
   slope_fn_pack(model, v, p, dv);
 }
 
+static int steady_node_count(grid_model_t *model)
+{
+  int package_nodes = model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA;
+  size_t plane_nodes;
+  size_t maximum_grid_nodes = (size_t)INT_MAX - package_nodes;
+
+  if (model->n_layers <= 0 || model->rows <= 0 || model->cols <= 0)
+    fatal("invalid grid dimensions in steady-state solver\n");
+  plane_nodes = (size_t)model->rows * (size_t)model->cols;
+  if ((size_t)model->n_layers > maximum_grid_nodes / plane_nodes)
+    fatal("steady-state node count exceeds supported integer range\n");
+  return (int)((size_t)model->n_layers * plane_nodes + package_nodes);
+}
+
+#if GATE_GS0 > 0
+
+#define GS0_PATH_SIZE 4096
+#define GS0_MAX_NODE_COUNT 2048
+
+static const char * const gs0_package_node_names[EXTRA + EXTRA_SEC] = {
+  "SP_W", "SP_E", "SP_N", "SP_S",
+  "SINK_C_W", "SINK_C_E", "SINK_C_N", "SINK_C_S",
+  "SINK_W", "SINK_E", "SINK_N", "SINK_S",
+  "SUB_W", "SUB_E", "SUB_N", "SUB_S",
+  "SOLDER_W", "SOLDER_E", "SOLDER_N", "SOLDER_S",
+  "PCB_C_W", "PCB_C_E", "PCB_C_N", "PCB_C_S",
+  "PCB_W", "PCB_E", "PCB_N", "PCB_S"
+};
+
+static void gs0_validate_package_node_order(void)
+{
+  static const int package_node_indices[EXTRA + EXTRA_SEC] = {
+    SP_W, SP_E, SP_N, SP_S,
+    SINK_C_W, SINK_C_E, SINK_C_N, SINK_C_S,
+    SINK_W, SINK_E, SINK_N, SINK_S,
+    SUB_W, SUB_E, SUB_N, SUB_S,
+    SOLDER_W, SOLDER_E, SOLDER_N, SOLDER_S,
+    PCB_C_W, PCB_C_E, PCB_C_N, PCB_C_S,
+    PCB_W, PCB_E, PCB_N, PCB_S
+  };
+  int index;
+  for (index = 0; index < EXTRA + EXTRA_SEC; index++)
+    if (package_node_indices[index] != index)
+      fatal("G-S0 package node names do not match HotSpot indices\n");
+}
+
+static const char *gs0_output_prefix(void)
+{
+  const char *prefix = getenv("HOTSPOT_GS0_PREFIX");
+  return prefix && prefix[0] ? prefix : NULL;
+}
+
+static FILE *gs0_open_output(const char *prefix, const char *suffix,
+                             const char *mode)
+{
+  char path[GS0_PATH_SIZE];
+  char message[GS0_PATH_SIZE + 80];
+  int length = snprintf(path, sizeof(path), "%s%s", prefix, suffix);
+  FILE *stream;
+  if (length < 0 || length >= (int)sizeof(path))
+    fatal("HOTSPOT_GS0_PREFIX is too long\n");
+  stream = fopen(path, mode);
+  if (!stream) {
+    snprintf(message, sizeof(message), "unable to open G-S0 output %s\n", path);
+    fatal(message);
+  }
+  return stream;
+}
+
+static void gs0_write_doubles(const char *prefix, const char *suffix,
+                              const double *values, size_t count)
+{
+  FILE *stream = gs0_open_output(prefix, suffix, "wb");
+  if (fwrite(values, sizeof(double), count, stream) != count) {
+    fclose(stream);
+    fatal("unable to write complete G-S0 binary output\n");
+  }
+  if (fclose(stream) != 0)
+    fatal("unable to close G-S0 binary output\n");
+}
+
+static void gs0_write_completion(const char *prefix, const char *suffix)
+{
+  static const char marker[] = "complete\n";
+  FILE *stream = gs0_open_output(prefix, suffix, "wb");
+  if (fwrite(marker, 1, sizeof(marker) - 1, stream) != sizeof(marker) - 1) {
+    fclose(stream);
+    fatal("unable to write G-S0 completion marker\n");
+  }
+  if (fclose(stream) != 0)
+    fatal("unable to close G-S0 completion marker\n");
+}
+
+static void gs0_write_node_map(grid_model_t *model, const char *prefix)
+{
+  int failed;
+  int index = 0;
+  int layer, row, column, package_index;
+  int package_nodes = model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA;
+  FILE *stream = gs0_open_output(prefix, ".nodes.tsv", "w");
+  for (layer = 0; layer < model->n_layers; layer++)
+    for (row = 0; row < model->rows; row++)
+      for (column = 0; column < model->cols; column++)
+        fprintf(stream, "%d\tgrid\t%d\t%d\t%d\n",
+                index++, layer, row, column);
+  for (package_index = 0; package_index < package_nodes; package_index++)
+    fprintf(stream, "%d\tpackage\t%s\n", index++,
+            gs0_package_node_names[package_index]);
+  failed = ferror(stream);
+  if (fclose(stream) != 0)
+    failed = 1;
+  if (failed)
+    fatal("unable to write complete G-S0 node map\n");
+}
+
+static void gs0_write_metadata(grid_model_t *model, const char *prefix,
+                               const char *arm, int probe_count,
+                               int basis_action_count, int input_check_count,
+                               int input_mutation_count,
+                               double coupling_asymmetry)
+{
+  unsigned short endian_probe = 1;
+  int failed;
+  int package_nodes = model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA;
+  FILE *stream = gs0_open_output(prefix, ".meta", "w");
+  fprintf(stream, "format=hotspot-gs0-v1\n");
+  fprintf(stream, "arm=%s\n", arm);
+  fprintf(stream, "dispatch=%s\n", SUPERLU > 0 ? "superlu" : "mfpcg");
+  fprintf(stream, "scalar=float64-native\n");
+  fprintf(stream, "byte_order=%s\n",
+          *((unsigned char *)&endian_probe) ? "little" : "big");
+  fprintf(stream, "matrix_order=row-major\n");
+  fprintf(stream, "node_count=%d\n", steady_node_count(model));
+  fprintf(stream, "rows=%d\n", model->rows);
+  fprintf(stream, "cols=%d\n", model->cols);
+  fprintf(stream, "layers=%d\n", model->n_layers);
+  fprintf(stream, "package_nodes=%d\n", package_nodes);
+  fprintf(stream, "probe_count=%d\n", probe_count);
+  fprintf(stream, "basis_action_count=%d\n", basis_action_count);
+  fprintf(stream, "input_check_count=%d\n", input_check_count);
+  fprintf(stream, "input_mutation_count=%d\n", input_mutation_count);
+  fprintf(stream, "input_unchanged=%d\n", input_mutation_count == 0);
+  fprintf(stream, "action_entry=%s\n",
+          probe_count > 0 ? "steady_matvec" : "superlu_builders");
+  fprintf(stream, "pcg_started_at_operator_export=0\n");
+  fprintf(stream, "package_node_order_checked=1\n");
+#if SUPERLU > 0
+  fprintf(stream, "superlu_index_bytes=%lu\n", (unsigned long)sizeof(int_t));
+#endif
+  if (isfinite(coupling_asymmetry))
+    fprintf(stream, "grid_coupling_asymmetry=%.17g\n", coupling_asymmetry);
+  else
+    fprintf(stream, "grid_coupling_asymmetry=not_applicable\n");
+  if (probe_count > 0) {
+    fprintf(stream, "linearity_0=4,0,0.25,1,-1.5\n");
+    fprintf(stream, "linearity_1=5,2,-2,3,0.75\n");
+  }
+  failed = ferror(stream);
+  if (fclose(stream) != 0)
+    failed = 1;
+  if (failed)
+    fatal("unable to write complete G-S0 metadata\n");
+  gs0_validate_package_node_order();
+  gs0_write_node_map(model, prefix);
+}
+
+static void gs0_write_state(grid_model_t *model, const double *state)
+{
+  const char *prefix = gs0_output_prefix();
+  if (prefix) {
+    gs0_write_doubles(prefix, ".state.bin", state,
+                      (size_t)steady_node_count(model));
+    gs0_write_completion(prefix, ".state.complete");
+  }
+}
+
+#endif
+
 #if SUPERLU < 1
 
 #define PCG_MAX_ITERATIONS 5000
@@ -3115,12 +3300,6 @@ static double dot_product(const double *a, const double *b, int count)
   for (i = 0; i < count; i++)
     sum += a[i] * b[i];
   return sum;
-}
-
-static int steady_node_count(grid_model_t *model)
-{
-  return model->n_layers * model->rows * model->cols +
-    (model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA);
 }
 
 /* slope_fn_grid returns C^-1(b-Ax).  Multiplying by the exact node
@@ -3173,14 +3352,14 @@ static void steady_residual(grid_model_t *model, grid_model_vector_t *power,
 {
   int count = steady_node_count(model);
   int i;
-  slope_fn_grid(model, (double *)x, power, residual);
+  slope_fn_grid(model, x, power, residual);
   for (i = 0; i < count; i++)
     residual[i] *= cap[i];
 }
 
 static void steady_matvec(grid_model_t *model, grid_model_vector_t *power,
                           const double *cap, const double *rhs,
-                          double *x, double *product)
+                          const double *x, double *product, double *scaled)
 {
   int count = steady_node_count(model);
   int i;
@@ -3194,12 +3373,10 @@ static void steady_matvec(grid_model_t *model, grid_model_vector_t *power,
   }
   scale = 1.0 / magnitude;
   for (i = 0; i < count; i++)
-    x[i] *= scale;
-  steady_residual(model, power, cap, x, product);
-  for (i = 0; i < count; i++) {
+    scaled[i] = x[i] * scale;
+  steady_residual(model, power, cap, scaled, product);
+  for (i = 0; i < count; i++)
     product[i] = (rhs[i] - product[i]) / scale;
-    x[i] /= scale;
-  }
 }
 
 static double relative_difference(double a, double b)
@@ -3242,7 +3419,7 @@ static void build_jacobi_diagonal(grid_model_t *model,
                                   grid_model_vector_t *power,
                                   const double *cap, const double *rhs,
                                   double *diagonal, double *basis,
-                                  double *work)
+                                  double *work, double *scaled)
 {
   int n, i, j, k;
   int nl = model->n_layers;
@@ -3304,7 +3481,7 @@ static void build_jacobi_diagonal(grid_model_t *model,
   for (k = grid_nodes; k < count; k++) {
     zero_dvector(basis, count);
     basis[k] = 1.0;
-    steady_matvec(model, power, cap, rhs, basis, work);
+    steady_matvec(model, power, cap, rhs, basis, work, scaled);
     diagonal[k] = work[k];
   }
 
@@ -3313,6 +3490,107 @@ static void build_jacobi_diagonal(grid_model_t *model,
       fatal("invalid Jacobi diagonal in detailed-3D PCG solver\n");
 }
 
+#if GATE_GS0 > 0
+
+#define GS0_PROBE_COUNT 8
+
+static void gs0_build_probes(double *probes, int count)
+{
+  int i;
+  for (i = 0; i < count; i++) {
+    double sign = (i & 1) ? -1.0 : 1.0;
+    probes[0 * count + i] = sign * (double)(1 + i % 7) * 1.0e-12;
+    probes[1 * count + i] = -sign * (1.0 + (double)(i % 5) / 8.0) * 1.0e12;
+    probes[2 * count + i] = (double)(i % 17 - 8);
+    probes[3 * count + i] = 280.0 + (double)(i % 19) / 2.0;
+    probes[6 * count + i] = sign * (1.0 + (double)(i % 11) / 4.0) *
+      (i % 3 == 0 ? 1.0e-12 : (i % 3 == 1 ? 1.0 : 1.0e12));
+    probes[7 * count + i] = (double)((i * 37) % 101 - 50) / 8.0;
+  }
+  for (i = 0; i < count; i++) {
+    probes[4 * count + i] =
+      0.25 * probes[0 * count + i] - 1.5 * probes[1 * count + i];
+    probes[5 * count + i] =
+      -2.0 * probes[2 * count + i] + 0.75 * probes[3 * count + i];
+  }
+}
+
+static void gs0_export_matrix_free(grid_model_t *model,
+                                   grid_model_vector_t *power,
+                                   const double *cap, const double *rhs,
+                                   const double *diagonal,
+                                   double coupling_asymmetry,
+                                   int residual_input_unchanged,
+                                   double *basis, double *work,
+                                   double *scaled)
+{
+  const char *prefix = gs0_output_prefix();
+  int count = steady_node_count(model);
+  int input_mutation_count = residual_input_unchanged ? 0 : 1;
+  int i, j;
+  double *matrix;
+  double *probes;
+  double *actions;
+  double *input_copy;
+
+  if (!prefix)
+    return;
+  if (!model->config.detailed_3D_used)
+    fatal("G-S0 export requires detailed-3D mode\n");
+  if (count > GS0_MAX_NODE_COUNT)
+    fatal("G-S0 dense export is restricted to at most 2048 nodes\n");
+
+  matrix = (double *)calloc((size_t)count * count, sizeof(double));
+  probes = (double *)calloc((size_t)GS0_PROBE_COUNT * count, sizeof(double));
+  actions = (double *)calloc((size_t)GS0_PROBE_COUNT * count, sizeof(double));
+  input_copy = (double *)calloc(count, sizeof(double));
+  if (!matrix || !probes || !actions || !input_copy)
+    fatal("memory allocation failed in G-S0 matrix-free export\n");
+
+  for (j = 0; j < count; j++) {
+    zero_dvector(basis, count);
+    basis[j] = 1.0;
+    memcpy(input_copy, basis, (size_t)count * sizeof(double));
+    steady_matvec(model, power, cap, rhs, basis, work, scaled);
+    if (memcmp(input_copy, basis, (size_t)count * sizeof(double)) != 0)
+      input_mutation_count++;
+    for (i = 0; i < count; i++)
+      matrix[(size_t)i * count + j] = work[i];
+  }
+
+  gs0_build_probes(probes, count);
+  for (j = 0; j < GS0_PROBE_COUNT; j++) {
+    double *input = &probes[(size_t)j * count];
+    double *action = &actions[(size_t)j * count];
+    memcpy(input_copy, input, (size_t)count * sizeof(double));
+    steady_matvec(model, power, cap, rhs, input, action, scaled);
+    if (memcmp(input_copy, input, (size_t)count * sizeof(double)) != 0)
+      input_mutation_count++;
+  }
+
+  gs0_write_doubles(prefix, ".matrix.bin", matrix,
+                    (size_t)count * count);
+  gs0_write_doubles(prefix, ".rhs.bin", rhs, (size_t)count);
+  gs0_write_doubles(prefix, ".diag.bin", diagonal, (size_t)count);
+  gs0_write_doubles(prefix, ".probes.bin", probes,
+                    (size_t)GS0_PROBE_COUNT * count);
+  gs0_write_doubles(prefix, ".probe_actions.bin", actions,
+                    (size_t)GS0_PROBE_COUNT * count);
+  gs0_write_metadata(model, prefix, "mfpcg", GS0_PROBE_COUNT, count,
+                     count + GS0_PROBE_COUNT + 1, input_mutation_count,
+                     coupling_asymmetry);
+  gs0_write_completion(prefix, ".operator.complete");
+
+  free(matrix);
+  free(probes);
+  free(actions);
+  free(input_copy);
+  if (input_mutation_count != 0)
+    fatal("steady_matvec modified a G-S0 input vector\n");
+}
+
+#endif
+
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
                                    grid_model_vector_t *temp)
@@ -3320,7 +3598,11 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   int count = steady_node_count(model);
   int i, iteration;
   int converged = 0;
+#if GATE_GS0 > 0
+  int residual_input_unchanged = 1;
+#endif
   const char *termination_status;
+  double coupling_asymmetry;
   double rhs_norm, residual_norm;
   double rho, next_rho, alpha, beta, pap;
   double *cap = (double *)calloc(count, sizeof(double));
@@ -3331,7 +3613,11 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   double *product = (double *)calloc(count, sizeof(double));
   double *diagonal = (double *)calloc(count, sizeof(double));
   double *probe = (double *)calloc(count, sizeof(double));
+  double *scaled = (double *)calloc(count, sizeof(double));
   double *x = temp->cuboid[0][0];
+#if GATE_GS0 > 0
+  double bitwise_zero = 0.0;
+#endif
 
   /* Steady-only HotSpot normally leaves C uninitialized.  PCG does not use
    * thermal capacitance physically; populate it only as an algebraic scaling
@@ -3339,19 +3625,40 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   if (!model->c_ready)
     populate_C_model_grid(model, NULL);
   if (!cap || !rhs || !r || !z || !direction || !product || !diagonal ||
-      !probe)
+      !probe || !scaled)
     fatal("memory allocation failed in detailed-3D PCG solver\n");
 
   build_capacitance_vector(model, cap);
   for (i = 0; i < count; i++)
     if (!(cap[i] > 0.0) || !isfinite(cap[i]))
       fatal("invalid capacitance scaling in detailed-3D PCG solver\n");
-  if (maximum_grid_coupling_asymmetry(model) > PCG_SYMMETRY_TOLERANCE)
+  coupling_asymmetry = maximum_grid_coupling_asymmetry(model);
+#if GATE_GS0 < 1
+  if (coupling_asymmetry > PCG_SYMMETRY_TOLERANCE)
     fatal("detailed-3D steady operator has asymmetric grid couplings\n");
+#endif
   zero_dvector(probe, count);
   steady_residual(model, power, cap, probe, rhs);
+#if GATE_GS0 > 0
+  for (i = 0; i < count; i++)
+    if (memcmp(&probe[i], &bitwise_zero, sizeof(double)) != 0)
+      residual_input_unchanged = 0;
+#endif
   build_jacobi_diagonal(model, power, cap, rhs,
-                        diagonal, direction, product);
+                        diagonal, direction, product, scaled);
+#if GATE_GS0 > 0
+  gs0_export_matrix_free(model, power, cap, rhs, diagonal,
+                         coupling_asymmetry, residual_input_unchanged,
+                         direction, product, scaled);
+  if (!residual_input_unchanged)
+    fatal("steady residual modified its G-S0 zero input vector\n");
+  if (coupling_asymmetry > PCG_SYMMETRY_TOLERANCE) {
+    const char *prefix = gs0_output_prefix();
+    if (prefix)
+      gs0_write_completion(prefix, ".rejected_before_pcg");
+    fatal("detailed-3D steady operator has asymmetric grid couplings\n");
+  }
+#endif
 
   set_heuristic_temp(model, power, temp);
   steady_residual(model, power, cap, x, r);
@@ -3374,7 +3681,7 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
       fatal("invalid initial residual in detailed-3D PCG solver\n");
 
     for (iteration = 0; iteration < PCG_MAX_ITERATIONS; iteration++) {
-      steady_matvec(model, power, cap, rhs, direction, product);
+      steady_matvec(model, power, cap, rhs, direction, product, scaled);
       pap = dot_product(direction, product, count);
       if (!(pap > 0.0) || !isfinite(pap))
         fatal("detailed-3D PCG encountered a non-positive direction\n");
@@ -3438,6 +3745,10 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   if (!converged)
     fatal("detailed-3D PCG reached its iteration limit\n");
 
+#if GATE_GS0 > 0
+  gs0_write_state(model, temp->cuboid[0][0]);
+#endif
+
   free(cap);
   free(rhs);
   free(r);
@@ -3446,6 +3757,7 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   free(product);
   free(diagonal);
   free(probe);
+  free(scaled);
 }
 
 #endif
@@ -4950,6 +5262,68 @@ SuperMatrix build_steady_rhs_vector(grid_model_t *model, grid_model_vector_t *po
   return B;
 }
 
+#if GATE_GS0 > 0
+
+static void gs0_export_superlu(grid_model_t *model, SuperMatrix *A,
+                               const double *rhs)
+{
+  const char *prefix = gs0_output_prefix();
+  NCformat *store;
+  double *values;
+  int_t *row_indices;
+  int_t *column_pointers;
+  double *matrix;
+  int count = steady_node_count(model);
+  int column;
+
+  if (!prefix)
+    return;
+  if (!model->config.detailed_3D_used)
+    fatal("G-S0 export requires detailed-3D mode\n");
+  if (count > GS0_MAX_NODE_COUNT)
+    fatal("G-S0 dense export is restricted to at most 2048 nodes\n");
+  if (A->Stype != SLU_NC || A->Dtype != SLU_D ||
+      A->nrow != count || A->ncol != count)
+    fatal("unexpected SuperLU matrix format in G-S0 export\n");
+
+  store = (NCformat *)A->Store;
+  if (!store || !store->nzval || !store->rowind || !store->colptr)
+    fatal("incomplete SuperLU storage in G-S0 export\n");
+  values = (double *)store->nzval;
+  row_indices = (int_t *)store->rowind;
+  column_pointers = (int_t *)store->colptr;
+  if (store->nnz < 0 || column_pointers[0] != 0 ||
+      column_pointers[count] != store->nnz)
+    fatal("invalid SuperLU column pointers in G-S0 export\n");
+  matrix = (double *)calloc((size_t)count * count, sizeof(double));
+  if (!matrix)
+    fatal("memory allocation failed in G-S0 SuperLU export\n");
+
+  for (column = 0; column < count; column++) {
+    int_t position;
+    if (column_pointers[column] < 0 ||
+        column_pointers[column] > column_pointers[column + 1] ||
+        column_pointers[column + 1] > store->nnz)
+      fatal("invalid SuperLU column range in G-S0 export\n");
+    for (position = column_pointers[column];
+         position < column_pointers[column + 1]; position++) {
+      int_t row = row_indices[position];
+      if (row < 0 || row >= count)
+        fatal("invalid row index in G-S0 SuperLU export\n");
+      matrix[(size_t)row * count + (size_t)column] += values[position];
+    }
+  }
+
+  gs0_write_doubles(prefix, ".matrix.bin", matrix,
+                    (size_t)count * count);
+  gs0_write_doubles(prefix, ".rhs.bin", rhs, (size_t)count);
+  gs0_write_metadata(model, prefix, "superlu", 0, 0, 0, 0, NAN);
+  gs0_write_completion(prefix, ".operator.complete");
+  free(matrix);
+}
+
+#endif
+
 void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vector_t *temp)
 {
   SuperMatrix A, L, U, B;
@@ -4964,18 +5338,18 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   DNformat     *Astore;
   double       *dp;
 
-  /* shortcuts	*/
-  int nr = model->rows;
-  int nc = model->cols;
-  int nl = model->n_layers;
-
-  if (model->config.model_secondary)
-    dim = nl*nr*nc + EXTRA + EXTRA_SEC;
-  else
-    dim = nl*nr*nc + EXTRA;
+  dim = steady_node_count(model);
+#if GATE_GS0 > 0
+  if (dim > GS0_MAX_NODE_COUNT)
+    fatal("G-S0 dense export is restricted to at most 2048 nodes\n");
+#endif
 
   A = build_steady_grid_matrix(model);
   B = build_steady_rhs_vector(model, power, &rhs);
+
+#if GATE_GS0 > 0
+  gs0_export_superlu(model, &A, rhs);
+#endif
 
   if ( !(perm_r = intMalloc(dim)) ) fatal("Malloc fails for perm_r[].\n");
   if ( !(perm_c = intMalloc(dim)) ) fatal("Malloc fails for perm_c[].\n");
@@ -4992,13 +5366,19 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
 
   /* Solve the linear system. */
   dgssv(&options, &A, perm_c, perm_r, &L, &U, &B, &stat, &info);
+  if (info != 0)
+    fatal("SuperLU failed to solve the detailed-3D steady system\n");
 
   Astore = (DNformat *) B.Store;
   dp = (double *) Astore->nzval;
-  //copy results back to last_steady
+  /* Copy the solution into the caller-provided destination vector. */
   for(i=0; i<dim; ++i){
-      model->last_steady->cuboid[0][0][i] = dp[i];
+      temp->cuboid[0][0][i] = dp[i];
   }
+
+#if GATE_GS0 > 0
+  gs0_write_state(model, temp->cuboid[0][0]);
+#endif
 
   SUPERLU_FREE (rhs);
   SUPERLU_FREE (perm_r);

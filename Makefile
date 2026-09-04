@@ -104,6 +104,16 @@ ifndef DEBUG3D
 DEBUG3D = 0
 endif
 
+# Benchmark-only exact operator export for the ThermoDSE G-S0 gate [0-1].
+ifndef GATE_GS0
+GATE_GS0 = 0
+endif
+ifneq ($(GATE_GS0),0)
+ifneq ($(GATE_GS0),1)
+$(error GATE_GS0 must be 0 or 1)
+endif
+endif
+
 # Numerical ID for each acceleration engine
 ifeq ($(MATHACCEL), none)
 ACCELNUM = 0
@@ -129,7 +139,7 @@ ifdef LIBDIR
 LIBDIRFLAG = -L$(LIBDIR)
 endif
 
-CFLAGS	= $(OFLAGS) $(EXTRAFLAGS) $(INCDIRFLAG) $(LIBDIRFLAG) -DVERBOSE=$(VERBOSE) -DMATHACCEL=$(ACCELNUM) -DDEBUG3D=$(DEBUG3D) -DSUPERLU=$(SUPERLU) -g
+CFLAGS	= $(OFLAGS) $(EXTRAFLAGS) $(INCDIRFLAG) $(LIBDIRFLAG) -DVERBOSE=$(VERBOSE) -DMATHACCEL=$(ACCELNUM) -DDEBUG3D=$(DEBUG3D) -DGATE_GS0=$(GATE_GS0) -DSUPERLU=$(SUPERLU) -g
 
 # sources, objects, headers and inputs
 
