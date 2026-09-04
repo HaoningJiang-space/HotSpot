@@ -1198,7 +1198,7 @@ void dump_steady_temp_grid (grid_model_t *model, char *file)
     fprintf(fp, "Layer %d:\n", n);
     for(i=0; i < model->rows; i++) {
       for(j=0; j < model->cols; j++) {
-        fprintf(fp, "%d\t%.2f\n", i*model->cols+j,
+        fprintf(fp, "%d\t%.17g\n", i*model->cols+j,
                 model->last_steady->cuboid[first_layer+n][i][j]);
       }
     }
