@@ -33,6 +33,9 @@
 #define GS1_ARM_SUPERLU 3
 #define GS1_ARM_MFPCG 4
 
+/* Shared common-stop tolerance used by G-S1 metadata and iterative solvers. */
+#define PCG_RELATIVE_RESIDUAL 1.0e-10
+
 #if GATE_GS1_ARM > 0
 static double gs1_program_start_s;
 
@@ -3593,7 +3596,6 @@ static void gs0_write_state(grid_model_t *model, const double *state)
 #if SUPERLU < 1
 
 #define PCG_MAX_ITERATIONS 5000
-#define PCG_RELATIVE_RESIDUAL 1.0e-10
 #define PCG_SYMMETRY_TOLERANCE 1.0e-10
 
 static double dot_product(const double *a, const double *b, int count)
