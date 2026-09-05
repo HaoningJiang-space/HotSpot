@@ -4445,7 +4445,10 @@ SuperMatrix build_steady_grid_matrix(grid_model_t *model)
   int nr = model->rows;
   int nc = model->cols;
   int nl = model->n_layers;
-  int spidx, hsidx, subidx, solderidx, pcbidx;
+  int spidx, hsidx;
+  int subidx = LAYER_SUB;
+  int solderidx = LAYER_SOLDER;
+  int pcbidx = LAYER_PCB;
   int model_secondary = model->config.model_secondary;
   double cw = model->width / model->cols;
   double ch = model->height / model->rows;
@@ -4454,12 +4457,6 @@ SuperMatrix build_steady_grid_matrix(grid_model_t *model)
 
   spidx = nl - DEFAULT_PACK_LAYERS + LAYER_SP;
   hsidx = nl - DEFAULT_PACK_LAYERS + LAYER_SINK;
-  if(model_secondary){
-      subidx = LAYER_SUB;
-      solderidx = LAYER_SOLDER;
-      pcbidx = LAYER_PCB;	
-  }
-
   /* Initialize matrix A. */
   if(model_secondary){
       m = n = (nl*nc*nr + EXTRA + EXTRA_SEC);
