@@ -82,35 +82,88 @@ enum {
   CONDUCTANCE_COUNT
 };
 
-#define STEADY_CONDUCTANCE(model, n, i, j, direction) \
-  ((model)->steady_conductance[((((n) * (model)->rows + (i)) * \
-                                 (model)->cols + (j)) * CONDUCTANCE_COUNT) + \
-                               (direction)])
+#define DETAILED_CONDUCTANCE(model, n, i, j, direction) \
+  ((model)->detailed_conductance[((((n) * (model)->rows + (i)) * \
+                                   (model)->cols + (j)) * CONDUCTANCE_COUNT) + \
+                                 (direction)])
 
-static void populate_steady_conductance(grid_model_t *model)
+/* The grid-node temperatures live at cell centers.  At a lateral material
+ * boundary, heat crosses half of each neighboring cell in series.  Using a
+ * single shared conductance makes the finite-volume flux reciprocal and
+ * conservative. */
+static double lateral_interface_conductance(grid_model_t *model, int n,
+                                             int i, int j,
+                                             int neighbor_i,
+                                             int neighbor_j, int choice)
+{
+  double local_resistance = find_res_3D(n, i, j, model, choice);
+  double neighbor_resistance =
+    find_res_3D(n, neighbor_i, neighbor_j, model, choice);
+  double resistance_sum;
+  double conductance;
+
+  if (!(local_resistance > 0.0) || !isfinite(local_resistance) ||
+      !(neighbor_resistance > 0.0) || !isfinite(neighbor_resistance))
+    fatal("invalid detailed-3D lateral resistance\n");
+  resistance_sum = local_resistance + neighbor_resistance;
+  conductance = 2.0 / resistance_sum;
+  if (!isfinite(resistance_sum) || !(conductance > 0.0) ||
+      !isfinite(conductance))
+    fatal("invalid detailed-3D lateral conductance\n");
+  return conductance;
+}
+
+static double vertical_interface_conductance(grid_model_t *model, int n,
+                                              int i, int j)
+{
+  double resistance = find_res_3D(n, i, j, model, 3);
+  double conductance;
+
+  if (!(resistance > 0.0) || !isfinite(resistance))
+    fatal("invalid detailed-3D vertical resistance\n");
+  conductance = 1.0 / resistance;
+  if (!(conductance > 0.0) || !isfinite(conductance))
+    fatal("invalid detailed-3D vertical conductance\n");
+  return conductance;
+}
+
+static void populate_detailed_conductance(grid_model_t *model)
 {
   int n, i, j;
   int nl = model->n_layers;
   int nr = model->rows;
   int nc = model->cols;
+  double conductance;
 
-  free_dvector(model->steady_conductance);
-  model->steady_conductance = dvector(nl * nr * nc * CONDUCTANCE_COUNT);
+  free_dvector(model->detailed_conductance);
+  model->detailed_conductance =
+    dvector(nl * nr * nc * CONDUCTANCE_COUNT);
   for (n = 0; n < nl; n++)
     for (i = 0; i < nr; i++)
       for (j = 0; j < nc; j++) {
-        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH) =
-          (i > 0) ? 1.0 / find_res_3D(n, i-1, j, model, 2) : 0.0;
-        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH) =
-          (i < nr-1) ? 1.0 / find_res_3D(n, i+1, j, model, 2) : 0.0;
-        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST) =
-          (j < nc-1) ? 1.0 / find_res_3D(n, i, j+1, model, 1) : 0.0;
-        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST) =
-          (j > 0) ? 1.0 / find_res_3D(n, i, j-1, model, 1) : 0.0;
-        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE) =
-          (n > 0) ? 1.0 / find_res_3D(n-1, i, j, model, 3) : 0.0;
-        STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW) =
-          (n < nl-1) ? 1.0 / find_res_3D(n, i, j, model, 3) : 0.0;
+        if (i < nr-1) {
+          conductance = lateral_interface_conductance(
+            model, n, i, j, i+1, j, 2);
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH) =
+            conductance;
+          DETAILED_CONDUCTANCE(model, n, i+1, j, CONDUCTANCE_NORTH) =
+            conductance;
+        }
+        if (j < nc-1) {
+          conductance = lateral_interface_conductance(
+            model, n, i, j, i, j+1, 1);
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST) =
+            conductance;
+          DETAILED_CONDUCTANCE(model, n, i, j+1, CONDUCTANCE_WEST) =
+            conductance;
+        }
+        if (n < nl-1) {
+          conductance = vertical_interface_conductance(model, n, i, j);
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW) =
+            conductance;
+          DETAILED_CONDUCTANCE(model, n+1, i, j, CONDUCTANCE_ABOVE) =
+            conductance;
+        }
       }
 }
 
@@ -890,7 +943,7 @@ void populate_R_model_grid(grid_model_t *model, flp_t *flp)
 
   /* done	*/
   if (model->config.detailed_3D_used)
-    populate_steady_conductance(model);
+    populate_detailed_conductance(model);
   model->r_ready = TRUE;
 }
 
@@ -1000,7 +1053,7 @@ void delete_grid_model(grid_model_t *model)
 
   free_grid_model_vector(model->last_steady);
   free_grid_model_vector(model->last_trans);
-  free_dvector(model->steady_conductance);
+  free_dvector(model->detailed_conductance);
   free(model->layers);
   free(model);
 }
@@ -2346,12 +2399,12 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
               // BU_3D: call new macros if detailed_3D model is used 
               // the spreader/heat sink layers will use uniform R
               if(model->config.detailed_3D_used){
-                  north = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH);
-                  south = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH);
-                  east = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST);
-                  west = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST);
-                  above = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE);
-                  below = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
+                  north = DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH);
+                  south = DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH);
+                  east = DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST);
+                  west = DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST);
+                  above = DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE);
+                  below = DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
 
                   csum = north + south + east + west + above + below;
 
@@ -2993,23 +3046,6 @@ void slope_fn_pack(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
 /* current(power) from the next cell above. zero if on top face			*/
 # define AP(l,v,n,i,j,nl,nr,nc)		((n > 0) ? ((A3D(v,n-1,i,j,nl,nr,nc)-A3D(v,n,i,j,nl,nr,nc))/l[n-1].rz) : 0.0)
 
-//BU_3D: These are the same macros as above except that they have to check
-//for a resistivity value first since the lc model is not uniform across the layer
-/* current(power) from the next cell north. zero if on northern boundary	*/
-# define NP_det3D(l,v,n,i,j,nl,nr,nc)		((i > 0) ? ((A3D(v,n,i-1,j,nl,nr,nc)-A3D(v,n,i,j,nl,nr,nc))/find_res_3D(n, i-1, j, model,2)) : 0.0)
-/* current(power) from the next cell south. zero if on southern boundary	*/
-# define SP_det3D(l,v,n,i,j,nl,nr,nc)		((i < nr-1) ? ((A3D(v,n,i+1,j,nl,nr,nc)-A3D(v,n,i,j,nl,nr,nc))/find_res_3D(n, i+1, j, model,2)) : 0.0)
-/* current(power) from the next cell east. zero if on eastern boundary	*/
-# define EP_det3D(l,v,n,i,j,nl,nr,nc)		((j < nc-1) ? ((A3D(v,n,i,j+1,nl,nr,nc)-A3D(v,n,i,j,nl,nr,nc))/find_res_3D(n, i, j+1, model,1)) : 0.0)
-/* current(power) from the next cell west. zero if on western boundary	*/
-# define WP_det3D(l,v,n,i,j,nl,nr,nc)		((j > 0) ? ((A3D(v,n,i,j-1,nl,nr,nc)-A3D(v,n,i,j,nl,nr,nc))/find_res_3D(n, i, j-1, model,1)) : 0.0)
-/* current(power) from the next cell below. zero if on bottom face		*/
-# define BP_det3D(l,v,n,i,j,nl,nr,nc)		((n < nl-1) ? ((A3D(v,n+1,i,j,nl,nr,nc)-A3D(v,n,i,j,nl,nr,nc))/find_res_3D(n, i, j, model,3)) : 0.0)
-/* current(power) from the next cell above. zero if on top face			*/
-# define AP_det3D(l,v,n,i,j,nl,nr,nc)		((n > 0) ? ((A3D(v,n-1,i,j,nl,nr,nc)-A3D(v,n,i,j,nl,nr,nc))/find_res_3D(n-1, i, j, model,3)) : 0.0)
-//end->BU_3D
-
-
 /* compute the slope vector for the grid cells. the transient
  * equation is CdV + sum{(T - Ti)/Ri} = P 
  * so, slope = dV = [P + sum{(Ti-T)/Ri}]/C
@@ -3054,9 +3090,31 @@ void slope_fn_grid(grid_model_t *model, double *v, grid_model_vector_t *p, doubl
           // BU_3D: uses grid specific values for all layers 
           // spreader and heat sink layers will use uniform R
           if(model->config.detailed_3D_used == 1){
-              psum = NP_det3D(l,v,n,i,j,nl,nr,nc) + SP_det3D(l,v,n,i,j,nl,nr,nc) + 
-                EP_det3D(l,v,n,i,j,nl,nr,nc) + WP_det3D(l,v,n,i,j,nl,nr,nc) + 
-                AP_det3D(l,v,n,i,j,nl,nr,nc) + BP_det3D(l,v,n,i,j,nl,nr,nc);
+              psum =
+                ((i > 0) ?
+                 (A3D(v,n,i-1,j,nl,nr,nc) - A3D(v,n,i,j,nl,nr,nc)) *
+                 DETAILED_CONDUCTANCE(model, n, i, j,
+                                      CONDUCTANCE_NORTH) : 0.0) +
+                ((i < nr-1) ?
+                 (A3D(v,n,i+1,j,nl,nr,nc) - A3D(v,n,i,j,nl,nr,nc)) *
+                 DETAILED_CONDUCTANCE(model, n, i, j,
+                                      CONDUCTANCE_SOUTH) : 0.0) +
+                ((j < nc-1) ?
+                 (A3D(v,n,i,j+1,nl,nr,nc) - A3D(v,n,i,j,nl,nr,nc)) *
+                 DETAILED_CONDUCTANCE(model, n, i, j,
+                                      CONDUCTANCE_EAST) : 0.0) +
+                ((j > 0) ?
+                 (A3D(v,n,i,j-1,nl,nr,nc) - A3D(v,n,i,j,nl,nr,nc)) *
+                 DETAILED_CONDUCTANCE(model, n, i, j,
+                                      CONDUCTANCE_WEST) : 0.0) +
+                ((n > 0) ?
+                 (A3D(v,n-1,i,j,nl,nr,nc) - A3D(v,n,i,j,nl,nr,nc)) *
+                 DETAILED_CONDUCTANCE(model, n, i, j,
+                                      CONDUCTANCE_ABOVE) : 0.0) +
+                ((n < nl-1) ?
+                 (A3D(v,n+1,i,j,nl,nr,nc) - A3D(v,n,i,j,nl,nr,nc)) *
+                 DETAILED_CONDUCTANCE(model, n, i, j,
+                                      CONDUCTANCE_BELOW) : 0.0);
           }
           else{
               psum = NP(l,v,n,i,j,nl,nr,nc) + SP(l,v,n,i,j,nl,nr,nc) + 
@@ -3254,9 +3312,8 @@ static double relative_difference(double a, double b)
   return fabs(a - b) / scale;
 }
 
-/* CG requires a symmetric operator.  Detailed-3D HotSpot permits spatially
- * varying resistance values whose historical one-sided interface rule can be
- * nonsymmetric, so reject such instances before entering PCG. */
+/* CG requires a symmetric operator.  Preserve this check as an invariant on
+ * the conservative detailed-3D interface cache before entering PCG. */
 static double maximum_grid_coupling_asymmetry(grid_model_t *model)
 {
   int n, i, j;
@@ -3270,16 +3327,16 @@ static double maximum_grid_coupling_asymmetry(grid_model_t *model)
       for (j = 0; j < nc; j++) {
         if (j + 1 < nc)
           mismatch = MAX(mismatch, relative_difference(
-                STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST),
-                STEADY_CONDUCTANCE(model, n, i, j + 1, CONDUCTANCE_WEST)));
+                DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST),
+                DETAILED_CONDUCTANCE(model, n, i, j + 1, CONDUCTANCE_WEST)));
         if (i + 1 < nr)
           mismatch = MAX(mismatch, relative_difference(
-                STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH),
-                STEADY_CONDUCTANCE(model, n, i + 1, j, CONDUCTANCE_NORTH)));
+                DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH),
+                DETAILED_CONDUCTANCE(model, n, i + 1, j, CONDUCTANCE_NORTH)));
         if (n + 1 < nl)
           mismatch = MAX(mismatch, relative_difference(
-                STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW),
-                STEADY_CONDUCTANCE(model, n + 1, i, j, CONDUCTANCE_ABOVE)));
+                DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW),
+                DETAILED_CONDUCTANCE(model, n + 1, i, j, CONDUCTANCE_ABOVE)));
       }
   return mismatch;
 }
@@ -3307,12 +3364,12 @@ static void build_jacobi_diagonal(grid_model_t *model,
       for (j = 0; j < nc; j++) {
         k = n * nr * nc + i * nc + j;
         diagonal[k] =
-          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH) +
-          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH) +
-          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST) +
-          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST) +
-          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE) +
-          STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH) +
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH) +
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST) +
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST) +
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE) +
+          DETAILED_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
         if (n == spidx) {
           if (i == 0 || i == nr - 1)
             diagonal[k] += 1.0 / (layer[n].ry / 2.0 + nc * model->pack.r_sp1_y);
@@ -3723,7 +3780,7 @@ SuperMatrix build_steady_grid_matrix(grid_model_t *model)
   int nr = model->rows;
   int nc = model->cols;
   int nl = model->n_layers;
-  int spidx, hsidx, subidx, solderidx, pcbidx;
+  int spidx, hsidx, subidx = -1, solderidx = -1, pcbidx = -1;
   int model_secondary = model->config.model_secondary;
   double cw = model->width / model->cols;
   double ch = model->height / model->rows;
@@ -3789,12 +3846,30 @@ SuperMatrix build_steady_grid_matrix(grid_model_t *model)
             grididx = i*nc + j;
 
             if(model->config.detailed_3D_used == 1){
-                if(j > 0)    Rw = find_res_3D(l,i,j-1,model,1); else Rw = LARGENUM;
-                if(j < nc-1) Re = find_res_3D(l,i,j+1,model,1); else Re = LARGENUM;
-                if(i > 0)    Rn = find_res_3D(l,i-1,j,model,2); else Rn = LARGENUM;
-                if(i < nr-1) Rs = find_res_3D(l,i+1,j,model,2); else Rs = LARGENUM;
-                if(l > 0)    Ra = find_res_3D(l-1,i,j,model,3); else Ra = LARGENUM;
-                if(l < nl-1) Rb = find_res_3D(l,i,j,model,3);   else Rb = LARGENUM;
+                if(j > 0)
+                    Rw = 1.0 / DETAILED_CONDUCTANCE(
+                      model, l, i, j, CONDUCTANCE_WEST);
+                else Rw = LARGENUM;
+                if(j < nc-1)
+                    Re = 1.0 / DETAILED_CONDUCTANCE(
+                      model, l, i, j, CONDUCTANCE_EAST);
+                else Re = LARGENUM;
+                if(i > 0)
+                    Rn = 1.0 / DETAILED_CONDUCTANCE(
+                      model, l, i, j, CONDUCTANCE_NORTH);
+                else Rn = LARGENUM;
+                if(i < nr-1)
+                    Rs = 1.0 / DETAILED_CONDUCTANCE(
+                      model, l, i, j, CONDUCTANCE_SOUTH);
+                else Rs = LARGENUM;
+                if(l > 0)
+                    Ra = 1.0 / DETAILED_CONDUCTANCE(
+                      model, l, i, j, CONDUCTANCE_ABOVE);
+                else Ra = LARGENUM;
+                if(l < nl-1)
+                    Rb = 1.0 / DETAILED_CONDUCTANCE(
+                      model, l, i, j, CONDUCTANCE_BELOW);
+                else Rb = LARGENUM;
             }
             else{
                 if(j > 0)    Rw = lyr[l].rx;   else Rw = LARGENUM;
