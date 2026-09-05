@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <stdint.h>
+#include <time.h>
 #ifdef _MSC_VER
 #define strcasecmp    _stricmp
 #define strncasecmp   _strnicmp
@@ -11,18 +13,62 @@
 #include <math.h>
 
 #include "temperature_grid.h"
+#include "flp.h"
+#include "util.h"
 
 #ifndef GATE_GS0
 #define GATE_GS0 0
+#endif
+
+#ifndef GATE_GS1_ARM
+#define GATE_GS1_ARM 0
+#endif
+
+#if GATE_GS0 > 0 && GATE_GS1_ARM > 0
+#error GATE_GS0 and GATE_GS1_ARM cannot be enabled together
+#endif
+
+#define GS1_ARM_GS_NATIVE 1
+#define GS1_ARM_GS_COMMON 2
+#define GS1_ARM_SUPERLU 3
+#define GS1_ARM_MFPCG 4
+
+#if GATE_GS1_ARM > 0
+static double gs1_program_start_s;
+
+static double gs1_now(void)
+{
+  struct timespec value;
+  if (clock_gettime(CLOCK_MONOTONIC, &value) != 0)
+    fatal("unable to read G-S1 monotonic clock\n");
+  return (double)value.tv_sec + (double)value.tv_nsec * 1.0e-9;
+}
+
+__attribute__((constructor)) static void gs1_capture_program_start(void)
+{
+  struct timespec value;
+  if (clock_gettime(CLOCK_MONOTONIC, &value) == 0)
+    gs1_program_start_s = (double)value.tv_sec + (double)value.tv_nsec * 1.0e-9;
+}
+
+static const char *gs1_arm_name(void);
+static const char *gs1_output_prefix(void);
+static void gs1_write_state(grid_model_t *model, const double *block_state,
+                            const char *prefix);
+static void gs1_write_metadata(grid_model_t *model, const char *prefix);
 #endif
 
 #if SUPERLU < 1
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
                                    grid_model_vector_t *temp);
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
+    GATE_GS1_ARM == GS1_ARM_GS_COMMON
+static void gs1_gauss_seidel_steady_grid(grid_model_t *model,
+                                         grid_model_vector_t *power,
+                                         grid_model_vector_t *temp);
 #endif
-#include "flp.h"
-#include "util.h"
+#endif
 
 #if SUPERLU > 0
 /* Lib for SuperLU */
@@ -729,6 +775,11 @@ grid_model_t *alloc_grid_model(thermal_config_t *config, flp_t *flp_default, int
   model = (grid_model_t *) calloc (1, sizeof(grid_model_t));
   if (!model)
     fatal("memory allocation error\n");
+#if GATE_GS1_ARM > 0
+  model->gs1_process_start_s = gs1_program_start_s;
+  model->gs1_relative_residual = NAN;
+  model->gs1_native_delta = NAN;
+#endif
   model->config = *config;
   model->rows = config->grid_rows;
   model->cols = config->grid_cols;
@@ -774,6 +825,9 @@ void populate_R_model_grid(grid_model_t *model, flp_t *flp)
 {
   int i, base;
   double cw, ch;
+#if GATE_GS1_ARM > 0
+  double gs1_started_s = gs1_now();
+#endif
 
   int inner_layers;
   int silidx, hsidx, pcbidx;
@@ -894,9 +948,15 @@ void populate_R_model_grid(grid_model_t *model, flp_t *flp)
   }
 
   /* done	*/
-  if (model->config.detailed_3D_used)
+  if (model->config.detailed_3D_used &&
+      GATE_GS1_ARM != GS1_ARM_GS_NATIVE &&
+      GATE_GS1_ARM != GS1_ARM_GS_COMMON &&
+      GATE_GS1_ARM != GS1_ARM_SUPERLU)
     populate_steady_conductance(model);
   model->r_ready = TRUE;
+#if GATE_GS1_ARM > 0
+  model->gs1_coefficient_s += gs1_now() - gs1_started_s;
+#endif
 }
 
 void populate_C_model_grid(grid_model_t *model, flp_t *flp)
@@ -2305,12 +2365,29 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
               // BU_3D: call new macros if detailed_3D model is used 
               // the spreader/heat sink layers will use uniform R
               if(model->config.detailed_3D_used){
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
+    GATE_GS1_ARM == GS1_ARM_GS_COMMON
+                  /* Preserve the shipped detailed-3D GS coefficient lookup. */
+                  north = (i > 0) ?
+                    1.0 / find_res_3D(n, i-1, j, model, 2) : 0.0;
+                  south = (i < nr-1) ?
+                    1.0 / find_res_3D(n, i+1, j, model, 2) : 0.0;
+                  east = (j < nc-1) ?
+                    1.0 / find_res_3D(n, i, j+1, model, 1) : 0.0;
+                  west = (j > 0) ?
+                    1.0 / find_res_3D(n, i, j-1, model, 1) : 0.0;
+                  above = (n > 0) ?
+                    1.0 / find_res_3D(n-1, i, j, model, 3) : 0.0;
+                  below = (n < nl-1) ?
+                    1.0 / find_res_3D(n, i, j, model, 3) : 0.0;
+#else
                   north = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_NORTH);
                   south = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_SOUTH);
                   east = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_EAST);
                   west = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_WEST);
                   above = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_ABOVE);
                   below = STEADY_CONDUCTANCE(model, n, i, j, CONDUCTANCE_BELOW);
+#endif
 
                   csum = north + south + east + west + above + below;
 
@@ -2658,6 +2735,9 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
 {
   grid_model_vector_t *p;
   double total;
+#if GATE_GS1_ARM > 0
+  double gs1_started_s;
+#endif
 
   if (!model->r_ready)
     fatal("R model not ready\n");
@@ -2673,6 +2753,17 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
   /* map the block power numbers to the grid	*/
   xlate_vector_b2g(model, power, p, V_POWER);
 
+#if GATE_GS1_ARM > 0
+  if (!(model->gs1_process_start_s > 0.0))
+    fatal("G-S1 process-start clock was not initialized\n");
+  model->gs1_input_model_s = gs1_now() - model->gs1_process_start_s -
+    model->gs1_coefficient_s;
+  if (model->gs1_input_model_s < 0.0)
+    fatal("invalid G-S1 input/model phase time\n");
+  fprintf(stdout, "G-S1 identity: arm=%s gate=%d superlu=%d\n",
+          gs1_arm_name(), GATE_GS1_ARM, SUPERLU);
+#endif
+
 #if SUPERLU > 0
   /* solve with SuperLU. use grid model's internal 
    * state vector to store the grid temperatures
@@ -2683,7 +2774,12 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
    * state vector to store the grid temperatures
    */ 
   if(model->config.detailed_3D_used){
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
+    GATE_GS1_ARM == GS1_ARM_GS_COMMON
+      gs1_gauss_seidel_steady_grid(model, p, model->last_steady);
+#else
       jacobi_pcg_steady_grid(model, p, model->last_steady);
+#endif
   }
   else{
       recursive_multigrid(model, p, model->last_steady);
@@ -2691,7 +2787,15 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
 #endif
 
   /* map the temperature numbers back	*/
+#if GATE_GS1_ARM > 0
+  gs1_started_s = gs1_now();
+#endif
   xlate_temp_g2b(model, temp, model->last_steady);
+#if GATE_GS1_ARM > 0
+  gs1_write_state(model, temp, gs1_output_prefix());
+  model->gs1_output_s += gs1_now() - gs1_started_s;
+  gs1_write_metadata(model, gs1_output_prefix());
+#endif
 
   free_grid_model_vector(p);
 }
@@ -3123,6 +3227,205 @@ static int steady_node_count(grid_model_t *model)
   return (int)((size_t)model->n_layers * plane_nodes + package_nodes);
 }
 
+#if GATE_GS1_ARM > 0
+
+#define GS1_PATH_SIZE 4096
+
+static const char * const gs1_package_node_names[EXTRA + EXTRA_SEC] = {
+  "SP_W", "SP_E", "SP_N", "SP_S",
+  "SINK_C_W", "SINK_C_E", "SINK_C_N", "SINK_C_S",
+  "SINK_W", "SINK_E", "SINK_N", "SINK_S",
+  "SUB_W", "SUB_E", "SUB_N", "SUB_S",
+  "SOLDER_W", "SOLDER_E", "SOLDER_N", "SOLDER_S",
+  "PCB_C_W", "PCB_C_E", "PCB_C_N", "PCB_C_S",
+  "PCB_W", "PCB_E", "PCB_N", "PCB_S"
+};
+
+static const char *gs1_arm_name(void)
+{
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
+  return "gs_native";
+#elif GATE_GS1_ARM == GS1_ARM_GS_COMMON
+  return "gs_common";
+#elif GATE_GS1_ARM == GS1_ARM_SUPERLU
+  return "superlu";
+#elif GATE_GS1_ARM == GS1_ARM_MFPCG
+  return "mfpcg";
+#else
+#error invalid GATE_GS1_ARM
+#endif
+}
+
+static const char *gs1_output_prefix(void)
+{
+  const char *prefix = getenv("HOTSPOT_GS1_PREFIX");
+  if (!prefix || !prefix[0])
+    fatal("HOTSPOT_GS1_PREFIX is required for a G-S1 benchmark build\n");
+  return prefix;
+}
+
+static FILE *gs1_open_output(const char *prefix, const char *suffix,
+                             const char *mode)
+{
+  char path[GS1_PATH_SIZE];
+  char message[GS1_PATH_SIZE + 80];
+  int length = snprintf(path, sizeof(path), "%s%s", prefix, suffix);
+  FILE *stream;
+  if (length < 0 || length >= (int)sizeof(path))
+    fatal("HOTSPOT_GS1_PREFIX is too long\n");
+  stream = fopen(path, mode);
+  if (!stream) {
+    snprintf(message, sizeof(message), "unable to open G-S1 output %s\n", path);
+    fatal(message);
+  }
+  return stream;
+}
+
+static void gs1_write_bytes(const char *prefix, const char *suffix,
+                            const void *values, size_t size, size_t count)
+{
+  FILE *stream = gs1_open_output(prefix, suffix, "wb");
+  if (fwrite(values, size, count, stream) != count) {
+    fclose(stream);
+    fatal("unable to write complete G-S1 binary output\n");
+  }
+  if (fclose(stream) != 0)
+    fatal("unable to close G-S1 binary output\n");
+}
+
+static void gs1_write_completion(const char *prefix, const char *suffix)
+{
+  static const char marker[] = "complete\n";
+  gs1_write_bytes(prefix, suffix, marker, 1, sizeof(marker) - 1);
+}
+
+static void gs1_write_node_map(grid_model_t *model, const char *prefix)
+{
+  int failed;
+  int index = 0;
+  int layer, row, column, package_index;
+  int package_nodes = model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA;
+  FILE *stream = gs1_open_output(prefix, ".nodes.tsv", "w");
+  for (layer = 0; layer < model->n_layers; layer++)
+    for (row = 0; row < model->rows; row++)
+      for (column = 0; column < model->cols; column++)
+        fprintf(stream, "%d\tgrid\t%d\t%d\t%d\n",
+                index++, layer, row, column);
+  for (package_index = 0; package_index < package_nodes; package_index++)
+    fprintf(stream, "%d\tpackage\t%s\n", index++,
+            gs1_package_node_names[package_index]);
+  failed = ferror(stream);
+  if (fclose(stream) != 0)
+    failed = 1;
+  if (failed)
+    fatal("unable to write complete G-S1 node map\n");
+}
+
+static void gs1_write_state(grid_model_t *model, const double *block_state,
+                            const char *prefix)
+{
+  const double *state = model->last_steady->cuboid[0][0];
+  int package_nodes = model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA;
+  gs1_write_bytes(prefix, ".state.bin", state, sizeof(double),
+                  (size_t)steady_node_count(model));
+  gs1_write_bytes(prefix, ".block-state.bin", block_state, sizeof(double),
+                  (size_t)(model->total_n_blocks + package_nodes));
+  gs1_write_node_map(model, prefix);
+  gs1_write_completion(prefix, ".state.complete");
+}
+
+static void gs1_write_metadata(grid_model_t *model, const char *prefix)
+{
+  unsigned short endian_probe = 1;
+  int failed;
+  int count = steady_node_count(model);
+  int package_nodes = model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA;
+  double managed = model->gs1_coefficient_s + model->gs1_initialization_s +
+    model->gs1_assembly_s + model->gs1_factor_s + model->gs1_solve_s;
+  const double *state = model->last_steady->cuboid[0][0];
+  double peak = state[0];
+  int peak_index = 0;
+  int index;
+  FILE *stream;
+  for (index = 1; index < count; index++)
+    if (state[index] > peak) {
+      peak = state[index];
+      peak_index = index;
+    }
+  stream = gs1_open_output(prefix, ".meta", "w");
+  fprintf(stream, "format=hotspot-gs1-v1\n");
+  fprintf(stream, "arm=%s\n", gs1_arm_name());
+  fprintf(stream, "dispatch=%s\n", gs1_arm_name());
+  fprintf(stream, "terminal=%s\n",
+          GATE_GS1_ARM == GS1_ARM_GS_NATIVE ? "native_complete" :
+          (GATE_GS1_ARM == GS1_ARM_MFPCG &&
+           (!(model->gs1_relative_residual <= PCG_RELATIVE_RESIDUAL) ||
+            !isfinite(model->gs1_relative_residual))) ?
+          "iteration_limit" : "converged");
+  fprintf(stream, "stopping_contract=%s\n",
+          GATE_GS1_ARM == GS1_ARM_GS_NATIVE ? "native_stop" : "common_stop");
+  fprintf(stream, "scalar=float64-native\n");
+  fprintf(stream, "byte_order=%s\n",
+          *((unsigned char *)&endian_probe) ? "little" : "big");
+  fprintf(stream, "temperature_unit=K\n");
+  fprintf(stream, "state_order=layer-row-column-then-package\n");
+  fprintf(stream, "node_count=%d\n", count);
+  fprintf(stream, "rows=%d\n", model->rows);
+  fprintf(stream, "cols=%d\n", model->cols);
+  fprintf(stream, "layers=%d\n", model->n_layers);
+  fprintf(stream, "package_nodes=%d\n", package_nodes);
+  fprintf(stream, "block_state_count=%d\n",
+          model->total_n_blocks + package_nodes);
+  fprintf(stream, "model_secondary=%d\n", model->config.model_secondary);
+  fprintf(stream, "detailed_3D=%d\n", model->config.detailed_3D_used);
+  fprintf(stream, "time_input_model_s=%.17g\n", model->gs1_input_model_s);
+  fprintf(stream, "time_coefficient_cache_s=%.17g\n", model->gs1_coefficient_s);
+  fprintf(stream, "time_initialization_s=%.17g\n", model->gs1_initialization_s);
+  fprintf(stream, "time_assembly_s=%.17g\n", model->gs1_assembly_s);
+  fprintf(stream, "time_preconditioner_factor_s=%.17g\n", model->gs1_factor_s);
+  fprintf(stream, "time_solve_s=%.17g\n", model->gs1_solve_s);
+  fprintf(stream, "time_output_s=%.17g\n", model->gs1_output_s);
+  fprintf(stream, "time_managed_s=%.17g\n", managed);
+  fprintf(stream, "iterations=%lld\n", model->gs1_iterations);
+  fprintf(stream, "solution_iterations=%lld\n",
+          model->gs1_solution_iterations);
+  fprintf(stream, "replay_iterations=%lld\n",
+          model->gs1_replay_iterations);
+  fprintf(stream, "operator_applications=%lld\n",
+          model->gs1_operator_applications);
+  fprintf(stream, "residual_evaluations=%lld\n",
+          model->gs1_residual_evaluations);
+  fprintf(stream, "residual_replacements=%lld\n",
+          model->gs1_residual_replacements);
+  fprintf(stream, "solver_vector_bytes=%lu\n",
+          (unsigned long)model->gs1_solver_vector_bytes);
+  fprintf(stream, "operator_bytes=%lu\n",
+          (unsigned long)model->gs1_operator_bytes);
+  fprintf(stream, "direct_permutation_bytes=%lu\n",
+          (unsigned long)model->gs1_direct_permutation_bytes);
+  fprintf(stream, "direct_l_nnz=%lld\n", model->gs1_direct_l_nnz);
+  fprintf(stream, "direct_u_nnz=%lld\n", model->gs1_direct_u_nnz);
+  if (isfinite(model->gs1_relative_residual))
+    fprintf(stream, "internal_relative_residual=%.17g\n",
+            model->gs1_relative_residual);
+  else
+    fprintf(stream, "internal_relative_residual=not_available\n");
+  if (isfinite(model->gs1_native_delta))
+    fprintf(stream, "native_delta=%.17g\n", model->gs1_native_delta);
+  else
+    fprintf(stream, "native_delta=not_available\n");
+  fprintf(stream, "peak_temperature_K=%.17g\n", peak);
+  fprintf(stream, "peak_state_index=%d\n", peak_index);
+  failed = ferror(stream);
+  if (fclose(stream) != 0)
+    failed = 1;
+  if (failed)
+    fatal("unable to write complete G-S1 metadata\n");
+  gs1_write_completion(prefix, ".complete");
+}
+
+#endif
+
 #if GATE_GS0 > 0
 
 #define GS0_PATH_SIZE 4096
@@ -3352,6 +3655,10 @@ static void steady_residual(grid_model_t *model, grid_model_vector_t *power,
 {
   int count = steady_node_count(model);
   int i;
+#if GATE_GS1_ARM == GS1_ARM_GS_COMMON || \
+    GATE_GS1_ARM == GS1_ARM_MFPCG
+  model->gs1_residual_evaluations++;
+#endif
   slope_fn_grid(model, x, power, residual);
   for (i = 0; i < count; i++)
     residual[i] *= cap[i];
@@ -3365,6 +3672,9 @@ static void steady_matvec(grid_model_t *model, grid_model_vector_t *power,
   int i;
   double magnitude = 0.0;
   double scale;
+#if GATE_GS1_ARM == GS1_ARM_MFPCG
+  model->gs1_operator_applications++;
+#endif
   for (i = 0; i < count; i++)
     magnitude = MAX(magnitude, fabs(x[i]));
   if (magnitude == 0.0) {
@@ -3490,6 +3800,112 @@ static void build_jacobi_diagonal(grid_model_t *model,
       fatal("invalid Jacobi diagonal in detailed-3D PCG solver\n");
 }
 
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
+    GATE_GS1_ARM == GS1_ARM_GS_COMMON
+
+#define GS1_COMMON_CHECK_INTERVAL 100
+
+static double gs1_residual_ratio(grid_model_t *model,
+                                 grid_model_vector_t *power,
+                                 const double *cap, const double *rhs,
+                                 double rhs_norm, const double *state,
+                                 double *residual)
+{
+  double norm;
+  steady_residual(model, power, cap, state, residual);
+  norm = sqrt(dot_product(residual, residual, steady_node_count(model)));
+  if (!isfinite(norm))
+    fatal("invalid G-S1 GS residual\n");
+  return norm / rhs_norm;
+}
+
+static void gs1_gauss_seidel_steady_grid(grid_model_t *model,
+                                         grid_model_vector_t *power,
+                                         grid_model_vector_t *temp)
+{
+  int count = steady_node_count(model);
+  double started_s;
+  double delta;
+  long long first_pass_sweeps = 0;
+
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
+  started_s = gs1_now();
+  set_heuristic_temp(model, power, temp);
+  model->gs1_initialization_s += gs1_now() - started_s;
+  started_s = gs1_now();
+  do {
+    delta = single_iteration_steady_grid(model, power, temp);
+    first_pass_sweeps++;
+  } while (!eq(delta, 0));
+  model->gs1_solve_s += gs1_now() - started_s;
+  model->gs1_iterations = first_pass_sweeps;
+  model->gs1_solution_iterations = first_pass_sweeps;
+  model->gs1_native_delta = delta;
+#else
+  double setup_started_s = gs1_now();
+  double *cap = (double *)calloc((size_t)count, sizeof(double));
+  double *rhs = (double *)calloc((size_t)count, sizeof(double));
+  double *residual = (double *)calloc((size_t)count, sizeof(double));
+  double *initial = (double *)calloc((size_t)count, sizeof(double));
+  double *state = temp->cuboid[0][0];
+  double rhs_norm;
+  double relative_residual = INFINITY;
+  long long replay_sweeps = 0;
+  long long final_interval_start;
+  int i;
+  if (!cap || !rhs || !residual || !initial)
+    fatal("memory allocation failed in G-S1 GS-common solver\n");
+  model->gs1_solver_vector_bytes = (size_t)count * sizeof(double) * 4;
+  if (!model->c_ready)
+    populate_C_model_grid(model, NULL);
+  build_capacitance_vector(model, cap);
+  zero_dvector(initial, count);
+  steady_residual(model, power, cap, initial, rhs);
+  rhs_norm = sqrt(dot_product(rhs, rhs, count));
+  if (!(rhs_norm > 0.0) || !isfinite(rhs_norm))
+    fatal("invalid G-S1 GS-common right-hand side\n");
+  set_heuristic_temp(model, power, temp);
+  for (i = 0; i < count; i++)
+    initial[i] = state[i];
+  model->gs1_initialization_s += gs1_now() - setup_started_s;
+
+  started_s = gs1_now();
+  do {
+    single_iteration_steady_grid(model, power, temp);
+    first_pass_sweeps++;
+    if (first_pass_sweeps % GS1_COMMON_CHECK_INTERVAL == 0)
+      relative_residual = gs1_residual_ratio(
+          model, power, cap, rhs, rhs_norm, state, residual);
+  } while (relative_residual > PCG_RELATIVE_RESIDUAL);
+
+  for (i = 0; i < count; i++)
+    state[i] = initial[i];
+  final_interval_start = first_pass_sweeps - GS1_COMMON_CHECK_INTERVAL;
+  relative_residual = INFINITY;
+  while (replay_sweeps < first_pass_sweeps) {
+    single_iteration_steady_grid(model, power, temp);
+    replay_sweeps++;
+    if (replay_sweeps > final_interval_start) {
+      relative_residual = gs1_residual_ratio(
+          model, power, cap, rhs, rhs_norm, state, residual);
+      if (relative_residual <= PCG_RELATIVE_RESIDUAL)
+        break;
+    }
+  }
+  model->gs1_iterations = first_pass_sweeps + replay_sweeps;
+  model->gs1_solution_iterations = replay_sweeps;
+  model->gs1_replay_iterations = replay_sweeps;
+  model->gs1_relative_residual = relative_residual;
+  free(cap);
+  free(rhs);
+  free(residual);
+  free(initial);
+  model->gs1_solve_s += gs1_now() - started_s;
+#endif
+}
+
+#endif
+
 #if GATE_GS0 > 0
 
 #define GS0_PROBE_COUNT 8
@@ -3605,6 +4021,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   double coupling_asymmetry;
   double rhs_norm, residual_norm;
   double rho, next_rho, alpha, beta, pap;
+#if GATE_GS1_ARM == GS1_ARM_MFPCG
+  double gs1_started_s = gs1_now();
+#endif
   double *cap = (double *)calloc(count, sizeof(double));
   double *rhs = (double *)calloc(count, sizeof(double));
   double *r = (double *)calloc(count, sizeof(double));
@@ -3615,6 +4034,11 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   double *probe = (double *)calloc(count, sizeof(double));
   double *scaled = (double *)calloc(count, sizeof(double));
   double *x = temp->cuboid[0][0];
+#if GATE_GS1_ARM == GS1_ARM_MFPCG
+  model->gs1_solver_vector_bytes = (size_t)count * sizeof(double) * 9;
+  model->gs1_operator_bytes = (size_t)model->n_layers * model->rows *
+    model->cols * CONDUCTANCE_COUNT * sizeof(double);
+#endif
 #if GATE_GS0 > 0
   double bitwise_zero = 0.0;
 #endif
@@ -3633,10 +4057,6 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
     if (!(cap[i] > 0.0) || !isfinite(cap[i]))
       fatal("invalid capacitance scaling in detailed-3D PCG solver\n");
   coupling_asymmetry = maximum_grid_coupling_asymmetry(model);
-#if GATE_GS0 < 1
-  if (coupling_asymmetry > PCG_SYMMETRY_TOLERANCE)
-    fatal("detailed-3D steady operator has asymmetric grid couplings\n");
-#endif
   zero_dvector(probe, count);
   steady_residual(model, power, cap, probe, rhs);
 #if GATE_GS0 > 0
@@ -3646,6 +4066,24 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
 #endif
   build_jacobi_diagonal(model, power, cap, rhs,
                         diagonal, direction, product, scaled);
+#if GATE_GS1_ARM == GS1_ARM_MFPCG
+  model->gs1_factor_s += gs1_now() - gs1_started_s;
+  {
+    const char *diagonal_prefix = getenv("HOTSPOT_GS1_DIAGONAL_PREFIX");
+    if (diagonal_prefix && diagonal_prefix[0]) {
+      gs1_write_bytes(diagonal_prefix, ".jacobi.bin", diagonal,
+                      sizeof(double), (size_t)count);
+      gs1_write_completion(diagonal_prefix, ".jacobi.complete");
+    }
+  }
+#endif
+#if GATE_GS0 < 1
+  /* Export the G-S1 Jacobi receipt first, but still reject the operator before
+   * the first Krylov step.  This lets the independent validator distinguish a
+   * scientific supported-domain STOP from a missing-artifact wiring failure. */
+  if (coupling_asymmetry > PCG_SYMMETRY_TOLERANCE)
+    fatal("detailed-3D steady operator has asymmetric grid couplings\n");
+#endif
 #if GATE_GS0 > 0
   gs0_export_matrix_free(model, power, cap, rhs, diagonal,
                          coupling_asymmetry, residual_input_unchanged,
@@ -3660,7 +4098,14 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   }
 #endif
 
+  #if GATE_GS1_ARM == GS1_ARM_MFPCG
+  gs1_started_s = gs1_now();
+  #endif
   set_heuristic_temp(model, power, temp);
+  #if GATE_GS1_ARM == GS1_ARM_MFPCG
+  model->gs1_initialization_s += gs1_now() - gs1_started_s;
+  gs1_started_s = gs1_now();
+  #endif
   steady_residual(model, power, cap, x, r);
   rhs_norm = sqrt(dot_product(rhs, rhs, count));
   if (!(rhs_norm > 0.0) || !isfinite(rhs_norm))
@@ -3707,6 +4152,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
           iteration++;
           break;
         }
+#if GATE_GS1_ARM == GS1_ARM_MFPCG
+        model->gs1_residual_replacements++;
+#endif
         for (i = 0; i < count; i++) {
           z[i] = r[i] / diagonal[i];
           direction[i] = z[i];
@@ -3736,6 +4184,11 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
     converged = residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm;
   }
   termination_status = converged ? "converged" : "iteration_limit";
+#if GATE_GS1_ARM == GS1_ARM_MFPCG
+  model->gs1_iterations = iteration;
+  model->gs1_solution_iterations = iteration;
+  model->gs1_relative_residual = residual_norm / rhs_norm;
+#endif
 #if VERBOSE > 0
   fprintf(stdout,
           "detailed-3D PCG termination: status=%s iterations=%d limit=%d relative_residual=%.9e\n",
@@ -3758,6 +4211,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   free(diagonal);
   free(probe);
   free(scaled);
+#if GATE_GS1_ARM == GS1_ARM_MFPCG
+  model->gs1_solve_s += gs1_now() - gs1_started_s;
+#endif
 }
 
 #endif
@@ -5324,6 +5780,78 @@ static void gs0_export_superlu(grid_model_t *model, SuperMatrix *A,
 
 #endif
 
+#if GATE_GS1_ARM == GS1_ARM_SUPERLU
+
+static void gs1_export_superlu_operator(grid_model_t *model, SuperMatrix *A,
+                                        const double *rhs)
+{
+  const char *prefix = getenv("HOTSPOT_GS1_OPERATOR_PREFIX");
+  unsigned short endian_probe = 1;
+  NCformat *store;
+  double *values;
+  int_t *row_indices;
+  int_t *column_pointers;
+  int64_t *rows64;
+  int64_t *columns64;
+  int count = steady_node_count(model);
+  int failed;
+  int_t position;
+  FILE *stream;
+  if (!prefix || !prefix[0])
+    return;
+  if (A->Stype != SLU_NC || A->Dtype != SLU_D ||
+      A->nrow != count || A->ncol != count)
+    fatal("unexpected SuperLU matrix format in G-S1 export\n");
+  store = (NCformat *)A->Store;
+  if (!store || !store->nzval || !store->rowind || !store->colptr ||
+      store->nnz < 0)
+    fatal("incomplete SuperLU storage in G-S1 export\n");
+  values = (double *)store->nzval;
+  row_indices = (int_t *)store->rowind;
+  column_pointers = (int_t *)store->colptr;
+  if (column_pointers[0] != 0 || column_pointers[count] != store->nnz)
+    fatal("invalid SuperLU column pointers in G-S1 export\n");
+  rows64 = (int64_t *)calloc((size_t)store->nnz, sizeof(int64_t));
+  columns64 = (int64_t *)calloc((size_t)count + 1, sizeof(int64_t));
+  if (!rows64 || !columns64)
+    fatal("memory allocation failed in G-S1 operator export\n");
+  for (position = 0; position < store->nnz; position++)
+    rows64[position] = (int64_t)row_indices[position];
+  for (position = 0; position <= count; position++)
+    columns64[position] = (int64_t)column_pointers[position];
+  gs1_write_bytes(prefix, ".values.bin", values, sizeof(double),
+                  (size_t)store->nnz);
+  gs1_write_bytes(prefix, ".rowind.i64.bin", rows64, sizeof(int64_t),
+                  (size_t)store->nnz);
+  gs1_write_bytes(prefix, ".colptr.i64.bin", columns64, sizeof(int64_t),
+                  (size_t)count + 1);
+  gs1_write_bytes(prefix, ".rhs.bin", rhs, sizeof(double), (size_t)count);
+  gs1_write_node_map(model, prefix);
+  stream = gs1_open_output(prefix, ".meta", "w");
+  fprintf(stream, "format=hotspot-gs1-operator-v1\n");
+  fprintf(stream, "storage=superlu-nc-csc\n");
+  fprintf(stream, "scalar=float64-native\n");
+  fprintf(stream, "index_storage=int64-native\n");
+  fprintf(stream, "byte_order=%s\n",
+          *((unsigned char *)&endian_probe) ? "little" : "big");
+  fprintf(stream, "source_index_bytes=%lu\n", (unsigned long)sizeof(int_t));
+  fprintf(stream, "node_count=%d\n", count);
+  fprintf(stream, "nnz=%lld\n", (long long)store->nnz);
+  fprintf(stream, "rows=%d\n", model->rows);
+  fprintf(stream, "cols=%d\n", model->cols);
+  fprintf(stream, "layers=%d\n", model->n_layers);
+  failed = ferror(stream);
+  if (fclose(stream) != 0)
+    failed = 1;
+  if (failed)
+    fatal("unable to write complete G-S1 operator metadata\n");
+  gs1_write_completion(prefix, ".operator.complete");
+  free(rows64);
+  free(columns64);
+}
+
+#endif
+
 void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vector_t *temp)
 {
   SuperMatrix A, L, U, B;
@@ -5337,6 +5865,9 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   int          i, dim;
   DNformat     *Astore;
   double       *dp;
+#if GATE_GS1_ARM == GS1_ARM_SUPERLU
+  double gs1_started_s;
+#endif
 
   dim = steady_node_count(model);
 #if GATE_GS0 > 0
@@ -5344,13 +5875,33 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
     fatal("G-S0 dense export is restricted to at most 2048 nodes\n");
 #endif
 
+#if GATE_GS1_ARM == GS1_ARM_SUPERLU
+  gs1_started_s = gs1_now();
+#endif
   A = build_steady_grid_matrix(model);
   B = build_steady_rhs_vector(model, power, &rhs);
+#if GATE_GS1_ARM == GS1_ARM_SUPERLU
+  model->gs1_assembly_s += gs1_now() - gs1_started_s;
+  {
+    NCformat *store = (NCformat *)A.Store;
+    model->gs1_operator_bytes =
+      (size_t)store->nnz * (sizeof(double) + sizeof(int_t)) +
+      ((size_t)dim + 1) * sizeof(int_t) + (size_t)dim * sizeof(double);
+  }
+  gs1_export_superlu_operator(model, &A, rhs);
+#endif
 
 #if GATE_GS0 > 0
   gs0_export_superlu(model, &A, rhs);
 #endif
 
+#if GATE_GS1_ARM == GS1_ARM_SUPERLU
+  /* dgssv does not expose consistently comparable wall-clock subphases.
+   * Charge every post-assembly setup and solve operation to one combined,
+   * monotonic-clock direct-factor/solve phase without inventing a split. */
+  gs1_started_s = gs1_now();
+  model->gs1_direct_permutation_bytes = (size_t)dim * sizeof(int_t) * 2;
+#endif
   if ( !(perm_r = intMalloc(dim)) ) fatal("Malloc fails for perm_r[].\n");
   if ( !(perm_c = intMalloc(dim)) ) fatal("Malloc fails for perm_c[].\n");
 
@@ -5368,6 +5919,16 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   dgssv(&options, &A, perm_c, perm_r, &L, &U, &B, &stat, &info);
   if (info != 0)
     fatal("SuperLU failed to solve the detailed-3D steady system\n");
+#if GATE_GS1_ARM == GS1_ARM_SUPERLU
+  {
+    SCformat *l_store = (SCformat *)L.Store;
+    NCformat *u_store = (NCformat *)U.Store;
+    if (!l_store || !u_store)
+      fatal("SuperLU returned incomplete factors\n");
+    model->gs1_direct_l_nnz = (long long)l_store->nnz;
+    model->gs1_direct_u_nnz = (long long)u_store->nnz;
+  }
+#endif
 
   Astore = (DNformat *) B.Store;
   dp = (double *) Astore->nzval;
@@ -5375,7 +5936,6 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   for(i=0; i<dim; ++i){
       temp->cuboid[0][0][i] = dp[i];
   }
-
 #if GATE_GS0 > 0
   gs0_write_state(model, temp->cuboid[0][0]);
 #endif
@@ -5388,5 +5948,8 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   Destroy_SuperNode_Matrix(&L);
   Destroy_CompCol_Matrix(&U);
   StatFree(&stat);
+#if GATE_GS1_ARM == GS1_ARM_SUPERLU
+  model->gs1_factor_s += gs1_now() - gs1_started_s;
+#endif
 }
 #endif

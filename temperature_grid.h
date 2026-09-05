@@ -1,6 +1,12 @@
 #ifndef __TEMPERATURE_GRID_H_
 #define __TEMPERATURE_GRID_H_
 
+#ifndef GATE_GS1_ARM
+#define GATE_GS1_ARM 0
+#endif
+
+#include <stddef.h>
+
 /* grid model differs from the block model in its use of
  * a mesh of cells whose resolution is configurable. unlike 
  * the block model, it can also model a stacked 3-D chip,
@@ -161,6 +167,31 @@ typedef struct grid_model_t_st
 
   /* six neighbor conductances per detailed-3D grid cell */
   double *steady_conductance;
+
+#if GATE_GS1_ARM > 0
+  /* Benchmark-only G-S1 phase and work receipts. */
+  double gs1_process_start_s;
+  double gs1_input_model_s;
+  double gs1_coefficient_s;
+  double gs1_initialization_s;
+  double gs1_assembly_s;
+  double gs1_factor_s;
+  double gs1_solve_s;
+  double gs1_output_s;
+  long long gs1_iterations;
+  long long gs1_solution_iterations;
+  long long gs1_replay_iterations;
+  long long gs1_operator_applications;
+  long long gs1_residual_evaluations;
+  long long gs1_residual_replacements;
+  size_t gs1_solver_vector_bytes;
+  size_t gs1_operator_bytes;
+  size_t gs1_direct_permutation_bytes;
+  long long gs1_direct_l_nnz;
+  long long gs1_direct_u_nnz;
+  double gs1_relative_residual;
+  double gs1_native_delta;
+#endif
 
   /* internal state - most recently computed
    * steady state temperatures

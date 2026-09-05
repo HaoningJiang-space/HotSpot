@@ -114,6 +114,26 @@ $(error GATE_GS0 must be 0 or 1)
 endif
 endif
 
+# Benchmark-only solver dispatch for the ThermoDSE G-S1 gate:
+# 0=production, 1=GS-native, 2=GS-common, 3=SuperLU, 4=MFPCG.
+ifndef GATE_GS1_ARM
+GATE_GS1_ARM = 0
+endif
+ifneq ($(filter $(GATE_GS1_ARM),0 1 2 3 4),$(GATE_GS1_ARM))
+$(error GATE_GS1_ARM must be 0, 1, 2, 3, or 4)
+endif
+ifeq ($(GATE_GS1_ARM),3)
+ifneq ($(SUPERLU),1)
+$(error GATE_GS1_ARM=3 requires SUPERLU=1)
+endif
+else
+ifneq ($(GATE_GS1_ARM),0)
+ifneq ($(SUPERLU),0)
+$(error GATE_GS1_ARM=$(GATE_GS1_ARM) requires SUPERLU=0)
+endif
+endif
+endif
+
 # Numerical ID for each acceleration engine
 ifeq ($(MATHACCEL), none)
 ACCELNUM = 0
@@ -139,7 +159,7 @@ ifdef LIBDIR
 LIBDIRFLAG = -L$(LIBDIR)
 endif
 
-CFLAGS	= $(OFLAGS) $(EXTRAFLAGS) $(INCDIRFLAG) $(LIBDIRFLAG) -DVERBOSE=$(VERBOSE) -DMATHACCEL=$(ACCELNUM) -DDEBUG3D=$(DEBUG3D) -DGATE_GS0=$(GATE_GS0) -DSUPERLU=$(SUPERLU) -g
+CFLAGS	= $(OFLAGS) $(EXTRAFLAGS) $(INCDIRFLAG) $(LIBDIRFLAG) -DVERBOSE=$(VERBOSE) -DMATHACCEL=$(ACCELNUM) -DDEBUG3D=$(DEBUG3D) -DGATE_GS0=$(GATE_GS0) -DGATE_GS1_ARM=$(GATE_GS1_ARM) -DSUPERLU=$(SUPERLU) -g
 
 # sources, objects, headers and inputs
 
