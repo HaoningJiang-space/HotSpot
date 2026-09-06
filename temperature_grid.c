@@ -1034,22 +1034,12 @@ void set_temp_grid(grid_model_t *model, double *temp, double val)
     temp[i] = val;
 }
 
-/* dump the steady state grid temperatures of the top layer onto 'file'	*/
+/* Diagnostic build: dump every configured layer without changing the solve. */
 void dump_top_layer_temp_grid (grid_model_t *model, char *file, grid_model_vector_t *temp)
 {
-  int i, j;
+  int i, j, l;
   char str[STR_SIZE];
   FILE *fp;
-  int silidx;
-
-  if (!model->config.model_secondary) {
-      silidx = LAYER_SI;
-  } else {
-      if(model->has_lcf)
-        silidx = SEC_PACK_LAYERS;
-      else
-        silidx = SEC_PACK_LAYERS + SEC_CHIP_LAYERS;
-  }
 
   if (!model->r_ready)
     fatal("R model not ready\n");
@@ -1066,29 +1056,16 @@ void dump_top_layer_temp_grid (grid_model_t *model, char *file, grid_model_vecto
       fatal(str);
   }
 
-  for(i=0; i < model->rows; i++){
-      for(j=0; j < model->cols; j++){
-          /* top layer of the most-recently computed 
-           * steady state temperature	
-           */
-  //        fprintf(fp, "%d\t%d\t%.2f\n", j, model->rows-i-1, 
-  //                model->last_steady->cuboid[silidx][i][j]); 
-          fprintf(fp, "%d\t%.2f\n", i*model->cols+j, 
-                  model->last_steady->cuboid[silidx][i][j]); 
+  for(l=0; l < model->n_layers; l++){
+      fprintf(fp, "Layer %d:\n", l);
+      for(i=0; i < model->rows; i++){
+          for(j=0; j < model->cols; j++){
+              fprintf(fp, "%d\t%.2f\n", i*model->cols+j,
+                      temp->cuboid[l][i][j]);
+          }
+          fprintf(fp, "\n");
       }
-      fprintf(fp, "\n");
   }
-
-  //int l;
-  //for(l=0;  l < model->n_layers; l++){
-  //    for(i=0; i < model->rows; i++){
-  //        for(j=0; j < model->cols; j++){
-  //            fprintf(fp, "%d\t%.2f\n", i*model->cols+j, 
-  //                    model->last_steady->cuboid[l][i][j]); 
-  //        }
-  //    }
-  //    fprintf(fp, "\n");
-  //}
  
   //rzdebug
   //int l;
@@ -1104,10 +1081,10 @@ void dump_top_layer_temp_grid (grid_model_t *model, char *file, grid_model_vecto
     fclose(fp);	
 }
 
-/* dump the steady state grid temperatures of the top layer onto 'file'	*/
+/* The diagnostic implementation above writes every configured layer. */
 void dump_steady_temp_grid (grid_model_t *model, char *file)
 {
-  /* top layer of the most-recently computed steady state temperature	*/
+  /* every layer of the most-recently computed steady state temperature */
   dump_top_layer_temp_grid(model, file, model->last_steady);
 }
 
