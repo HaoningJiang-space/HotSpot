@@ -787,6 +787,8 @@ grid_model_t *alloc_grid_model(thermal_config_t *config, flp_t *flp_default, int
   model->gs1_process_start_s = gs1_program_start_s;
   model->gs1_relative_residual = NAN;
   model->gs1_native_delta = NAN;
+  model->gs1_action_audit_max_abs_error = NAN;
+  model->gs1_action_audit_max_relative_error = NAN;
 #endif
   model->config = *config;
   model->rows = config->grid_rows;
@@ -3433,6 +3435,18 @@ static void gs1_write_metadata(grid_model_t *model, const char *prefix)
     fprintf(stream, "native_delta=%.17g\n", model->gs1_native_delta);
   else
     fprintf(stream, "native_delta=not_available\n");
+  fprintf(stream, "action_audit_probes=%d\n",
+          model->gs1_action_audit_probes);
+  if (isfinite(model->gs1_action_audit_max_abs_error))
+    fprintf(stream, "action_audit_max_abs_error=%.17g\n",
+            model->gs1_action_audit_max_abs_error);
+  else
+    fprintf(stream, "action_audit_max_abs_error=not_run\n");
+  if (isfinite(model->gs1_action_audit_max_relative_error))
+    fprintf(stream, "action_audit_max_relative_error=%.17g\n",
+            model->gs1_action_audit_max_relative_error);
+  else
+    fprintf(stream, "action_audit_max_relative_error=not_run\n");
   fprintf(stream, "peak_temperature_K=%.17g\n", peak);
   fprintf(stream, "peak_state_index=%d\n", peak_index);
   failed = ferror(stream);
@@ -3952,6 +3966,67 @@ static double relative_difference(double a, double b)
   return fabs(a - b) / scale;
 }
 
+#if SUPERLU > 0 && (GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+                     GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG)
+
+#define GS1_ACTION_AUDIT_PROBE_COUNT 3
+#define GS1_ACTION_AUDIT_TOLERANCE 1.0e-12
+
+/* This admission-only check compares each explicit PCG representation with
+ * the original detailed-3D operator on deterministic vectors.  It is opt-in
+ * so measured runs do not charge the audit to solver time. */
+static void gs1_audit_explicit_representation(
+    grid_model_t *model, grid_model_vector_t *power, const double *cap,
+    const double *rhs, const double *diagonal,
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG
+    const steady_csr_t *csr,
+#else
+    const steady_structured_t *structured,
+#endif
+    double *input, double *reference, double *candidate, double *scaled)
+{
+  const char *enabled = getenv("HOTSPOT_GS1_ACTION_AUDIT");
+  int count = steady_node_count(model);
+  int probe, index;
+  double max_abs_error = 0.0;
+  double max_relative_error = 0.0;
+
+  if (!enabled || strcmp(enabled, "1") != 0)
+    return;
+  for (probe = 0; probe < GS1_ACTION_AUDIT_PROBE_COUNT; probe++) {
+    for (index = 0; index < count; index++) {
+      if (probe == 0)
+        input[index] = (double)((index % 17) - 8);
+      else if (probe == 1)
+        input[index] = (double)(((index * 37) % 101) - 50) / 8.0;
+      else
+        input[index] = 0.25 * (double)((index % 17) - 8) -
+          1.5 * (double)(((index * 37) % 101) - 50) / 8.0;
+    }
+    steady_matvec(model, power, cap, rhs, input, reference, scaled);
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG
+    csr_matvec(csr, input, candidate);
+#else
+    structured_matvec(structured, diagonal, input, candidate,
+                      model->rows, model->cols);
+#endif
+    for (index = 0; index < count; index++) {
+      double absolute_error = fabs(candidate[index] - reference[index]);
+      max_abs_error = MAX(max_abs_error, absolute_error);
+      max_relative_error = MAX(max_relative_error,
+                               relative_difference(candidate[index],
+                                                   reference[index]));
+    }
+  }
+  model->gs1_action_audit_probes = GS1_ACTION_AUDIT_PROBE_COUNT;
+  model->gs1_action_audit_max_abs_error = max_abs_error;
+  model->gs1_action_audit_max_relative_error = max_relative_error;
+  if (max_relative_error > GS1_ACTION_AUDIT_TOLERANCE)
+    fatal("explicit PCG representation differs from HotSpot operator\n");
+}
+
+#endif
+
 /* CG requires a symmetric operator.  Detailed-3D HotSpot permits spatially
  * varying resistance values whose historical one-sided interface rule can be
  * nonsymmetric, so reject such instances before entering PCG. */
@@ -4278,6 +4353,13 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
     (size_t)structured.package_edge_count *
       (sizeof(int_t) * 2 + sizeof(double));
 #endif
+  gs1_audit_explicit_representation(model, power, cap, rhs, diagonal,
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG
+                                    &csr,
+#else
+                                    &structured,
+#endif
+                                    direction, r, product, scaled);
   SUPERLU_FREE(explicit_rhs);
   Destroy_CompCol_Matrix(&explicit_matrix);
   Destroy_SuperMatrix_Store(&explicit_rhs_matrix);
@@ -4286,7 +4368,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   build_jacobi_diagonal(model, power, cap, rhs,
                         diagonal, direction, product, scaled);
 #endif
-#if GATE_GS1_ARM == GS1_ARM_MFPCG
+#if GATE_GS1_ARM == GS1_ARM_MFPCG || \
+    GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   model->gs1_factor_s += gs1_now() - gs1_started_s;
   {
     const char *diagonal_prefix = getenv("HOTSPOT_GS1_DIAGONAL_PREFIX");

@@ -191,6 +191,9 @@ typedef struct grid_model_t_st
   long long gs1_direct_u_nnz;
   double gs1_relative_residual;
   double gs1_native_delta;
+  int gs1_action_audit_probes;
+  double gs1_action_audit_max_abs_error;
+  double gs1_action_audit_max_relative_error;
 #endif
 
   /* internal state - most recently computed
