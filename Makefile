@@ -115,13 +115,13 @@ endif
 endif
 
 # Benchmark-only solver dispatch for the ThermoDSE G-S1/G-S1.5 gates:
-# 0=production, 1=GS-native, 2=GS-common, 3=SuperLU, 4=MFPCG,
+# 0=production, 1=GS-native, 3=SuperLU, 4=MFPCG,
 # 5=explicit-CSR Jacobi-PCG, 6=structured-edge Jacobi-PCG.
 ifndef GATE_GS1_ARM
 GATE_GS1_ARM = 0
 endif
-ifneq ($(filter $(GATE_GS1_ARM),0 1 2 3 4 5 6),$(GATE_GS1_ARM))
-$(error GATE_GS1_ARM must be 0, 1, 2, 3, 4, 5, or 6)
+ifneq ($(filter $(GATE_GS1_ARM),0 1 3 4 5 6),$(GATE_GS1_ARM))
+$(error GATE_GS1_ARM must be 0, 1, 3, 4, 5, or 6)
 endif
 ifneq ($(filter $(GATE_GS1_ARM),3 5 6),)
 ifneq ($(SUPERLU),1)

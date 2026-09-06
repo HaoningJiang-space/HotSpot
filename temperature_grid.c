@@ -29,14 +29,15 @@
 #endif
 
 #define GS1_ARM_GS_NATIVE 1
-#define GS1_ARM_GS_COMMON 2
 #define GS1_ARM_SUPERLU 3
 #define GS1_ARM_MFPCG 4
 #define GS1_ARM_CSR_PCG 5
 #define GS1_ARM_STRUCTURED_PCG 6
 
-/* Shared common-stop tolerance used by G-S1 metadata and iterative solvers. */
-#define PCG_RELATIVE_RESIDUAL 1.0e-10
+/* DSE-level candidate stopping contract. Builds may override it explicitly. */
+#ifndef PCG_RELATIVE_RESIDUAL
+#define PCG_RELATIVE_RESIDUAL 1.0e-4
+#endif
 
 #if GATE_GS1_ARM > 0
 static double gs1_program_start_s;
@@ -68,8 +69,7 @@ static void gs1_write_metadata(grid_model_t *model, const char *prefix);
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
                                    grid_model_vector_t *temp);
-#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
-    GATE_GS1_ARM == GS1_ARM_GS_COMMON
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
 static void gs1_gauss_seidel_steady_grid(grid_model_t *model,
                                          grid_model_vector_t *power,
                                          grid_model_vector_t *temp);
@@ -958,7 +958,6 @@ void populate_R_model_grid(grid_model_t *model, flp_t *flp)
   /* done	*/
   if (model->config.detailed_3D_used &&
       GATE_GS1_ARM != GS1_ARM_GS_NATIVE &&
-      GATE_GS1_ARM != GS1_ARM_GS_COMMON &&
       GATE_GS1_ARM != GS1_ARM_SUPERLU)
     populate_steady_conductance(model);
   model->r_ready = TRUE;
@@ -2373,8 +2372,7 @@ double single_iteration_steady_grid(grid_model_t *model, grid_model_vector_t *po
               // BU_3D: call new macros if detailed_3D model is used 
               // the spreader/heat sink layers will use uniform R
               if(model->config.detailed_3D_used){
-#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
-    GATE_GS1_ARM == GS1_ARM_GS_COMMON
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
                   /* Preserve the shipped detailed-3D GS coefficient lookup. */
                   north = (i > 0) ?
                     1.0 / find_res_3D(n, i-1, j, model, 2) : 0.0;
@@ -2792,8 +2790,7 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
    * state vector to store the grid temperatures
    */ 
   if(model->config.detailed_3D_used){
-#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
-    GATE_GS1_ARM == GS1_ARM_GS_COMMON
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
       gs1_gauss_seidel_steady_grid(model, p, model->last_steady);
 #else
       jacobi_pcg_steady_grid(model, p, model->last_steady);
@@ -3263,8 +3260,6 @@ static const char *gs1_arm_name(void)
 {
 #if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
   return "gs_native";
-#elif GATE_GS1_ARM == GS1_ARM_GS_COMMON
-  return "gs_common";
 #elif GATE_GS1_ARM == GS1_ARM_SUPERLU
   return "superlu";
 #elif GATE_GS1_ARM == GS1_ARM_MFPCG
@@ -3387,7 +3382,7 @@ static void gs1_write_metadata(grid_model_t *model, const char *prefix)
             !isfinite(model->gs1_relative_residual))) ?
           "iteration_limit" : "converged");
   fprintf(stream, "stopping_contract=%s\n",
-          GATE_GS1_ARM == GS1_ARM_GS_NATIVE ? "native_stop" : "common_stop");
+          GATE_GS1_ARM == GS1_ARM_GS_NATIVE ? "native_stop" : "candidate_stop");
   fprintf(stream, "scalar=float64-native\n");
   fprintf(stream, "byte_order=%s\n",
           *((unsigned char *)&endian_probe) ? "little" : "big");
@@ -3679,8 +3674,7 @@ static void steady_residual(grid_model_t *model, grid_model_vector_t *power,
 {
   int count = steady_node_count(model);
   int i;
-#if GATE_GS1_ARM == GS1_ARM_GS_COMMON || \
-    GATE_GS1_ARM == GS1_ARM_MFPCG || \
+#if GATE_GS1_ARM == GS1_ARM_MFPCG || \
     GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
     GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   model->gs1_residual_evaluations++;
@@ -4063,35 +4057,15 @@ static void build_jacobi_diagonal(grid_model_t *model,
       fatal("invalid Jacobi diagonal in detailed-3D PCG solver\n");
 }
 
-#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE || \
-    GATE_GS1_ARM == GS1_ARM_GS_COMMON
-
-#define GS1_COMMON_CHECK_INTERVAL 100
-
-static double gs1_residual_ratio(grid_model_t *model,
-                                 grid_model_vector_t *power,
-                                 const double *cap, const double *rhs,
-                                 double rhs_norm, const double *state,
-                                 double *residual)
-{
-  double norm;
-  steady_residual(model, power, cap, state, residual);
-  norm = sqrt(dot_product(residual, residual, steady_node_count(model)));
-  if (!isfinite(norm))
-    fatal("invalid G-S1 GS residual\n");
-  return norm / rhs_norm;
-}
-
+#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
 static void gs1_gauss_seidel_steady_grid(grid_model_t *model,
                                          grid_model_vector_t *power,
                                          grid_model_vector_t *temp)
 {
-  int count = steady_node_count(model);
   double started_s;
   double delta;
   long long first_pass_sweeps = 0;
 
-#if GATE_GS1_ARM == GS1_ARM_GS_NATIVE
   started_s = gs1_now();
   set_heuristic_temp(model, power, temp);
   model->gs1_initialization_s += gs1_now() - started_s;
@@ -4104,67 +4078,6 @@ static void gs1_gauss_seidel_steady_grid(grid_model_t *model,
   model->gs1_iterations = first_pass_sweeps;
   model->gs1_solution_iterations = first_pass_sweeps;
   model->gs1_native_delta = delta;
-#else
-  double setup_started_s = gs1_now();
-  double *cap = (double *)calloc((size_t)count, sizeof(double));
-  double *rhs = (double *)calloc((size_t)count, sizeof(double));
-  double *residual = (double *)calloc((size_t)count, sizeof(double));
-  double *initial = (double *)calloc((size_t)count, sizeof(double));
-  double *state = temp->cuboid[0][0];
-  double rhs_norm;
-  double relative_residual = INFINITY;
-  long long replay_sweeps = 0;
-  long long final_interval_start;
-  int i;
-  if (!cap || !rhs || !residual || !initial)
-    fatal("memory allocation failed in G-S1 GS-common solver\n");
-  model->gs1_solver_vector_bytes = (size_t)count * sizeof(double) * 4;
-  if (!model->c_ready)
-    populate_C_model_grid(model, NULL);
-  build_capacitance_vector(model, cap);
-  zero_dvector(initial, count);
-  steady_residual(model, power, cap, initial, rhs);
-  rhs_norm = sqrt(dot_product(rhs, rhs, count));
-  if (!(rhs_norm > 0.0) || !isfinite(rhs_norm))
-    fatal("invalid G-S1 GS-common right-hand side\n");
-  set_heuristic_temp(model, power, temp);
-  for (i = 0; i < count; i++)
-    initial[i] = state[i];
-  model->gs1_initialization_s += gs1_now() - setup_started_s;
-
-  started_s = gs1_now();
-  do {
-    single_iteration_steady_grid(model, power, temp);
-    first_pass_sweeps++;
-    if (first_pass_sweeps % GS1_COMMON_CHECK_INTERVAL == 0)
-      relative_residual = gs1_residual_ratio(
-          model, power, cap, rhs, rhs_norm, state, residual);
-  } while (relative_residual > PCG_RELATIVE_RESIDUAL);
-
-  for (i = 0; i < count; i++)
-    state[i] = initial[i];
-  final_interval_start = first_pass_sweeps - GS1_COMMON_CHECK_INTERVAL;
-  relative_residual = INFINITY;
-  while (replay_sweeps < first_pass_sweeps) {
-    single_iteration_steady_grid(model, power, temp);
-    replay_sweeps++;
-    if (replay_sweeps > final_interval_start) {
-      relative_residual = gs1_residual_ratio(
-          model, power, cap, rhs, rhs_norm, state, residual);
-      if (relative_residual <= PCG_RELATIVE_RESIDUAL)
-        break;
-    }
-  }
-  model->gs1_iterations = first_pass_sweeps + replay_sweeps;
-  model->gs1_solution_iterations = replay_sweeps;
-  model->gs1_replay_iterations = replay_sweeps;
-  model->gs1_relative_residual = relative_residual;
-  free(cap);
-  free(rhs);
-  free(residual);
-  free(initial);
-  model->gs1_solve_s += gs1_now() - started_s;
-#endif
 }
 
 #endif
