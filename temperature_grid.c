@@ -32,6 +32,8 @@
 #define GS1_ARM_GS_COMMON 2
 #define GS1_ARM_SUPERLU 3
 #define GS1_ARM_MFPCG 4
+#define GS1_ARM_CSR_PCG 5
+#define GS1_ARM_STRUCTURED_PCG 6
 
 /* Shared common-stop tolerance used by G-S1 metadata and iterative solvers. */
 #define PCG_RELATIVE_RESIDUAL 1.0e-10
@@ -61,7 +63,8 @@ static void gs1_write_state(grid_model_t *model, const double *block_state,
 static void gs1_write_metadata(grid_model_t *model, const char *prefix);
 #endif
 
-#if SUPERLU < 1
+#if SUPERLU < 1 || GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
 static void jacobi_pcg_steady_grid(grid_model_t *model,
                                    grid_model_vector_t *power,
                                    grid_model_vector_t *temp);
@@ -72,6 +75,8 @@ static void gs1_gauss_seidel_steady_grid(grid_model_t *model,
                                          grid_model_vector_t *temp);
 #endif
 #endif
+
+static double relative_difference(double a, double b);
 
 #if SUPERLU > 0
 /* Lib for SuperLU */
@@ -2768,10 +2773,20 @@ void steady_state_temp_grid(grid_model_t *model, double *power, double *temp)
 #endif
 
 #if SUPERLU > 0
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
+  if(model->config.detailed_3D_used){
+      jacobi_pcg_steady_grid(model, p, model->last_steady);
+  }
+  else{
+      fatal("G-S1.5 PCG representations require detailed-3D mode\n");
+  }
+#else
   /* solve with SuperLU. use grid model's internal 
    * state vector to store the grid temperatures
    */ 
   direct_SLU(model, p, model->last_steady);
+#endif
 #else
   /* solve recursively. use grid model's internal 
    * state vector to store the grid temperatures
@@ -3254,6 +3269,10 @@ static const char *gs1_arm_name(void)
   return "superlu";
 #elif GATE_GS1_ARM == GS1_ARM_MFPCG
   return "mfpcg";
+#elif GATE_GS1_ARM == GS1_ARM_CSR_PCG
+  return "csr_pcg";
+#elif GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
+  return "structured_pcg";
 #else
 #error invalid GATE_GS1_ARM
 #endif
@@ -3361,7 +3380,9 @@ static void gs1_write_metadata(grid_model_t *model, const char *prefix)
   fprintf(stream, "dispatch=%s\n", gs1_arm_name());
   fprintf(stream, "terminal=%s\n",
           GATE_GS1_ARM == GS1_ARM_GS_NATIVE ? "native_complete" :
-          (GATE_GS1_ARM == GS1_ARM_MFPCG &&
+          ((GATE_GS1_ARM == GS1_ARM_MFPCG ||
+            GATE_GS1_ARM == GS1_ARM_CSR_PCG ||
+            GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG) &&
            (!(model->gs1_relative_residual <= PCG_RELATIVE_RESIDUAL) ||
             !isfinite(model->gs1_relative_residual))) ?
           "iteration_limit" : "converged");
@@ -3593,7 +3614,8 @@ static void gs0_write_state(grid_model_t *model, const double *state)
 
 #endif
 
-#if SUPERLU < 1
+#if SUPERLU < 1 || GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
 
 #define PCG_MAX_ITERATIONS 5000
 #define PCG_SYMMETRY_TOLERANCE 1.0e-10
@@ -3658,7 +3680,9 @@ static void steady_residual(grid_model_t *model, grid_model_vector_t *power,
   int count = steady_node_count(model);
   int i;
 #if GATE_GS1_ARM == GS1_ARM_GS_COMMON || \
-    GATE_GS1_ARM == GS1_ARM_MFPCG
+    GATE_GS1_ARM == GS1_ARM_MFPCG || \
+    GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   model->gs1_residual_evaluations++;
 #endif
   slope_fn_grid(model, x, power, residual);
@@ -3690,6 +3714,243 @@ static void steady_matvec(grid_model_t *model, grid_model_vector_t *power,
   for (i = 0; i < count; i++)
     product[i] = (rhs[i] - product[i]) / scale;
 }
+
+#if SUPERLU > 0
+/* Generic sparse storage for the G-S1.5 CSR arm.  This is deliberately not
+ * SuperLU's CSC: the candidate is a row-oriented SpMV PCG solve after the
+ * exact HotSpot matrix builder has completed. */
+typedef struct {
+  int count;
+  int_t nnz;
+  int_t *row_offsets;
+  int_t *columns;
+  double *values;
+} steady_csr_t;
+
+static void free_steady_csr(steady_csr_t *csr)
+{
+  free(csr->row_offsets);
+  free(csr->columns);
+  free(csr->values);
+  memset(csr, 0, sizeof(*csr));
+}
+
+static void csr_from_superlu(const SuperMatrix *matrix, steady_csr_t *csr,
+                             double *diagonal)
+{
+  NCformat *source = (NCformat *)matrix->Store;
+  int_t *cursor;
+  int column;
+  int_t index;
+  if (!source || matrix->nrow != matrix->ncol || matrix->nrow <= 0)
+    fatal("invalid explicit matrix for CSR-PCG\n");
+  csr->count = matrix->nrow;
+  csr->nnz = source->nnz;
+  csr->row_offsets = (int_t *)calloc((size_t)csr->count + 1, sizeof(int_t));
+  csr->columns = (int_t *)calloc((size_t)csr->nnz, sizeof(int_t));
+  csr->values = (double *)calloc((size_t)csr->nnz, sizeof(double));
+  if (!csr->row_offsets || !csr->columns || !csr->values)
+    fatal("memory allocation failed building CSR-PCG representation\n");
+  for (index = 0; index < csr->nnz; index++) {
+    int_t row = source->rowind[index];
+    if (row < 0 || row >= csr->count)
+      fatal("invalid row index in explicit HotSpot matrix\n");
+    csr->row_offsets[row + 1]++;
+  }
+  for (column = 0; column < csr->count; column++)
+    csr->row_offsets[column + 1] += csr->row_offsets[column];
+  cursor = (int_t *)calloc((size_t)csr->count, sizeof(int_t));
+  if (!cursor)
+    fatal("memory allocation failed building CSR row cursors\n");
+  memcpy(cursor, csr->row_offsets, (size_t)csr->count * sizeof(int_t));
+  for (column = 0; column < csr->count; column++)
+    for (index = source->colptr[column]; index < source->colptr[column + 1];
+         index++) {
+      int_t row = source->rowind[index];
+      int_t destination = cursor[row]++;
+      csr->columns[destination] = column;
+      csr->values[destination] = ((double *)source->nzval)[index];
+    }
+  free(cursor);
+  for (column = 0; column < csr->count; column++) {
+    int_t entry;
+    diagonal[column] = 0.0;
+    for (entry = csr->row_offsets[column];
+         entry < csr->row_offsets[column + 1]; entry++)
+      if (csr->columns[entry] == column) {
+        diagonal[column] = csr->values[entry];
+        break;
+      }
+    if (!(diagonal[column] > 0.0) || !isfinite(diagonal[column]))
+      fatal("invalid CSR Jacobi diagonal\n");
+  }
+}
+
+static void csr_matvec(const steady_csr_t *csr, const double *x,
+                       double *product)
+{
+  int row;
+  for (row = 0; row < csr->count; row++) {
+    int_t entry;
+    double sum = 0.0;
+    for (entry = csr->row_offsets[row]; entry < csr->row_offsets[row + 1];
+         entry++)
+      sum += csr->values[entry] * x[csr->columns[entry]];
+    product[row] = sum;
+  }
+}
+
+/* Exact hybrid structured representation.  Every regular grid-to-grid
+ * coupling is one of the positive-coordinate directions; all connections
+ * involving package nodes remain explicit compact edges.  Thus the format
+ * preserves package semantics rather than treating HotSpot as a seven-point
+ * stencil. */
+typedef struct {
+  int count;
+  int grid_count;
+  double *east;
+  double *south;
+  double *below;
+  int_t package_edge_count;
+  int_t *edge_left;
+  int_t *edge_right;
+  double *edge_value;
+} steady_structured_t;
+
+static void free_steady_structured(steady_structured_t *structured)
+{
+  free(structured->east);
+  free(structured->south);
+  free(structured->below);
+  free(structured->edge_left);
+  free(structured->edge_right);
+  free(structured->edge_value);
+  memset(structured, 0, sizeof(*structured));
+}
+
+static int structured_grid_direction(int column, int row, int grid_count,
+                                     int rows, int cols)
+{
+  int plane = rows * cols;
+  int column_layer = column / plane;
+  int column_in_plane = column % plane;
+  if (column < 0 || row < 0 || column >= grid_count || row >= grid_count)
+    return -1;
+  if (row == column + 1 && column_in_plane % cols + 1 < cols)
+    return 0;
+  if (row == column + cols && column_in_plane / cols + 1 < rows)
+    return 1;
+  if (row == column + plane && column_layer + 1 < grid_count / plane)
+    return 2;
+  return -1;
+}
+
+static void structured_from_superlu(const SuperMatrix *matrix,
+                                    steady_structured_t *structured,
+                                    double *diagonal, int rows, int cols,
+                                    int layers)
+{
+  NCformat *source = (NCformat *)matrix->Store;
+  int grid_count = rows * cols * layers;
+  int column;
+  int_t index, edge_cursor = 0;
+  if (!source || matrix->nrow != matrix->ncol || matrix->nrow <= grid_count)
+    fatal("invalid explicit matrix for structured-PCG\n");
+  structured->count = matrix->nrow;
+  structured->grid_count = grid_count;
+  structured->east = (double *)calloc((size_t)grid_count, sizeof(double));
+  structured->south = (double *)calloc((size_t)grid_count, sizeof(double));
+  structured->below = (double *)calloc((size_t)grid_count, sizeof(double));
+  if (!structured->east || !structured->south || !structured->below)
+    fatal("memory allocation failed building structured grid edges\n");
+  for (column = 0; column < structured->count; column++)
+    for (index = source->colptr[column]; index < source->colptr[column + 1];
+         index++) {
+      int row = source->rowind[index];
+      if (row < column)
+        continue;
+      if (row == column)
+        continue;
+      if (column >= grid_count || row >= grid_count) {
+        structured->package_edge_count++;
+      } else if (structured_grid_direction(column, row, grid_count, rows, cols) < 0) {
+        fatal("explicit HotSpot matrix has unsupported grid coupling\n");
+      }
+    }
+  structured->edge_left = (int_t *)calloc((size_t)structured->package_edge_count,
+                                           sizeof(int_t));
+  structured->edge_right = (int_t *)calloc((size_t)structured->package_edge_count,
+                                            sizeof(int_t));
+  structured->edge_value = (double *)calloc((size_t)structured->package_edge_count,
+                                             sizeof(double));
+  if (structured->package_edge_count && (!structured->edge_left ||
+      !structured->edge_right || !structured->edge_value))
+    fatal("memory allocation failed building structured package edges\n");
+  for (column = 0; column < structured->count; column++) {
+    diagonal[column] = 0.0;
+    for (index = source->colptr[column]; index < source->colptr[column + 1];
+         index++) {
+      int row = source->rowind[index];
+      double value = ((double *)source->nzval)[index];
+      if (row == column) {
+        diagonal[column] = value;
+      } else if (row > column) {
+        if (column >= grid_count || row >= grid_count) {
+          structured->edge_left[edge_cursor] = column;
+          structured->edge_right[edge_cursor] = row;
+          structured->edge_value[edge_cursor++] = value;
+        } else {
+          int direction = structured_grid_direction(column, row, grid_count,
+                                                    rows, cols);
+          double *destination = direction == 0 ? structured->east :
+            (direction == 1 ? structured->south : structured->below);
+          if (direction < 0 || destination[column] != 0.0)
+            fatal("duplicate or invalid structured grid edge\n");
+          destination[column] = value;
+        }
+      }
+    }
+    if (!(diagonal[column] > 0.0) || !isfinite(diagonal[column]))
+      fatal("invalid structured Jacobi diagonal\n");
+  }
+  if (edge_cursor != structured->package_edge_count)
+    fatal("incomplete structured package-edge conversion\n");
+}
+
+static void structured_matvec(const steady_structured_t *structured,
+                              const double *diagonal, const double *x,
+                              double *product, int rows, int cols)
+{
+  int index;
+  int plane = rows * cols;
+  for (index = 0; index < structured->count; index++)
+    product[index] = diagonal[index] * x[index];
+  for (index = 0; index < structured->grid_count; index++) {
+    if (structured->east[index] != 0.0) {
+      int neighbor = index + 1;
+      product[index] += structured->east[index] * x[neighbor];
+      product[neighbor] += structured->east[index] * x[index];
+    }
+    if (structured->south[index] != 0.0) {
+      int neighbor = index + cols;
+      product[index] += structured->south[index] * x[neighbor];
+      product[neighbor] += structured->south[index] * x[index];
+    }
+    if (structured->below[index] != 0.0) {
+      int neighbor = index + plane;
+      product[index] += structured->below[index] * x[neighbor];
+      product[neighbor] += structured->below[index] * x[index];
+    }
+  }
+  for (index = 0; index < structured->package_edge_count; index++) {
+    int left = structured->edge_left[index];
+    int right = structured->edge_right[index];
+    double value = structured->edge_value[index];
+    product[left] += value * x[right];
+    product[right] += value * x[left];
+  }
+}
+#endif
 
 static double relative_difference(double a, double b)
 {
@@ -4023,7 +4284,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   double coupling_asymmetry;
   double rhs_norm, residual_norm;
   double rho, next_rho, alpha, beta, pap;
-#if GATE_GS1_ARM == GS1_ARM_MFPCG
+#if GATE_GS1_ARM == GS1_ARM_MFPCG || \
+    GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   double gs1_started_s = gs1_now();
 #endif
   double *cap = (double *)calloc(count, sizeof(double));
@@ -4036,10 +4299,23 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   double *probe = (double *)calloc(count, sizeof(double));
   double *scaled = (double *)calloc(count, sizeof(double));
   double *x = temp->cuboid[0][0];
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG
+  steady_csr_t csr = {0};
+  SuperMatrix explicit_matrix, explicit_rhs_matrix;
+  double *explicit_rhs = NULL;
+#elif GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
+  steady_structured_t structured = {0};
+  SuperMatrix explicit_matrix, explicit_rhs_matrix;
+  double *explicit_rhs = NULL;
+#endif
 #if GATE_GS1_ARM == GS1_ARM_MFPCG
   model->gs1_solver_vector_bytes = (size_t)count * sizeof(double) * 9;
   model->gs1_operator_bytes = (size_t)model->n_layers * model->rows *
     model->cols * CONDUCTANCE_COUNT * sizeof(double);
+#elif GATE_GS1_ARM == GS1_ARM_CSR_PCG
+  model->gs1_solver_vector_bytes = (size_t)count * sizeof(double) * 9;
+#elif GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
+  model->gs1_solver_vector_bytes = (size_t)count * sizeof(double) * 9;
 #endif
 #if GATE_GS0 > 0
   double bitwise_zero = 0.0;
@@ -4066,8 +4342,37 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
     if (memcmp(&probe[i], &bitwise_zero, sizeof(double)) != 0)
       residual_input_unchanged = 0;
 #endif
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
+  gs1_started_s = gs1_now();
+  explicit_matrix = build_steady_grid_matrix(model);
+  explicit_rhs_matrix = build_steady_rhs_vector(model, power, &explicit_rhs);
+  if (!explicit_rhs)
+    fatal("missing explicit CSR-PCG right-hand side\n");
+  for (i = 0; i < count; i++)
+    if (relative_difference(rhs[i], explicit_rhs[i]) > 1.0e-12)
+      fatal("native and explicit HotSpot right-hand sides differ\n");
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG
+  csr_from_superlu(&explicit_matrix, &csr, diagonal);
+  model->gs1_operator_bytes =
+    ((size_t)csr.count + 1 + (size_t)csr.nnz * 2) * sizeof(int_t) +
+    (size_t)csr.nnz * sizeof(double);
+#else
+  structured_from_superlu(&explicit_matrix, &structured, diagonal,
+                          model->rows, model->cols, model->n_layers);
+  model->gs1_operator_bytes =
+    (size_t)structured.grid_count * sizeof(double) * 3 +
+    (size_t)structured.package_edge_count *
+      (sizeof(int_t) * 2 + sizeof(double));
+#endif
+  SUPERLU_FREE(explicit_rhs);
+  Destroy_CompCol_Matrix(&explicit_matrix);
+  Destroy_SuperMatrix_Store(&explicit_rhs_matrix);
+  model->gs1_assembly_s += gs1_now() - gs1_started_s;
+#else
   build_jacobi_diagonal(model, power, cap, rhs,
                         diagonal, direction, product, scaled);
+#endif
 #if GATE_GS1_ARM == GS1_ARM_MFPCG
   model->gs1_factor_s += gs1_now() - gs1_started_s;
   {
@@ -4100,11 +4405,15 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   }
 #endif
 
-  #if GATE_GS1_ARM == GS1_ARM_MFPCG
+  #if GATE_GS1_ARM == GS1_ARM_MFPCG || \
+      GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+      GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   gs1_started_s = gs1_now();
   #endif
   set_heuristic_temp(model, power, temp);
-  #if GATE_GS1_ARM == GS1_ARM_MFPCG
+  #if GATE_GS1_ARM == GS1_ARM_MFPCG || \
+      GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+      GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   model->gs1_initialization_s += gs1_now() - gs1_started_s;
   gs1_started_s = gs1_now();
   #endif
@@ -4128,7 +4437,16 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
       fatal("invalid initial residual in detailed-3D PCG solver\n");
 
     for (iteration = 0; iteration < PCG_MAX_ITERATIONS; iteration++) {
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG
+      model->gs1_operator_applications++;
+      csr_matvec(&csr, direction, product);
+#elif GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
+      model->gs1_operator_applications++;
+      structured_matvec(&structured, diagonal, direction, product,
+                        model->rows, model->cols);
+#else
       steady_matvec(model, power, cap, rhs, direction, product, scaled);
+#endif
       pap = dot_product(direction, product, count);
       if (!(pap > 0.0) || !isfinite(pap))
         fatal("detailed-3D PCG encountered a non-positive direction\n");
@@ -4154,7 +4472,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
           iteration++;
           break;
         }
-#if GATE_GS1_ARM == GS1_ARM_MFPCG
+#if GATE_GS1_ARM == GS1_ARM_MFPCG || \
+    GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
         model->gs1_residual_replacements++;
 #endif
         for (i = 0; i < count; i++) {
@@ -4186,7 +4506,9 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
     converged = residual_norm <= PCG_RELATIVE_RESIDUAL * rhs_norm;
   }
   termination_status = converged ? "converged" : "iteration_limit";
-#if GATE_GS1_ARM == GS1_ARM_MFPCG
+#if GATE_GS1_ARM == GS1_ARM_MFPCG || \
+    GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   model->gs1_iterations = iteration;
   model->gs1_solution_iterations = iteration;
   model->gs1_relative_residual = residual_norm / rhs_norm;
@@ -4213,7 +4535,14 @@ static void jacobi_pcg_steady_grid(grid_model_t *model,
   free(diagonal);
   free(probe);
   free(scaled);
-#if GATE_GS1_ARM == GS1_ARM_MFPCG
+#if GATE_GS1_ARM == GS1_ARM_CSR_PCG
+  free_steady_csr(&csr);
+#elif GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
+  free_steady_structured(&structured);
+#endif
+#if GATE_GS1_ARM == GS1_ARM_MFPCG || \
+    GATE_GS1_ARM == GS1_ARM_CSR_PCG || \
+    GATE_GS1_ARM == GS1_ARM_STRUCTURED_PCG
   model->gs1_solve_s += gs1_now() - gs1_started_s;
 #endif
 }
