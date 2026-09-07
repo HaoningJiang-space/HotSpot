@@ -38,6 +38,7 @@ microchannel_config_t default_microchannel_config(void)
   config.pumping_pressure  = 5000;
   config.pump_internal_res = 0;            // ideal pump
   config.cooling_branch_count = 0;
+  config.closed_branch_mask = 0;
   for(branch = 0; branch < MAX_COOLING_BRANCHES; branch++) {
     config.valve_resistance[branch] = 0.0;
     config.branch_flow[branch] = 0.0;
@@ -94,6 +95,12 @@ void microchannel_config_add_from_strs(microchannel_config_t *config, materials_
     if ((idx = get_str_index(table, size, option)) >= 0)
       if(sscanf(table[idx].value, "%lf", &config->valve_resistance[branch]) != 1)
         fatal("invalid format for branch valve resistance\n");
+  }
+  if ((idx = get_str_index(table, size, "closed_branch_mask")) >= 0) {
+    char trailing;
+    if(sscanf(table[idx].value, "%d %c", &config->closed_branch_mask, &trailing) != 1 ||
+       config->closed_branch_mask < 0 || config->closed_branch_mask > 15)
+      fatal("closed_branch_mask must be an integer from 0 to 15\n");
   }
   if ((idx = get_str_index(table, size, "pump_curve_resistance")) >= 0)
     if(sscanf(table[idx].value, "%lf", &config->pump_curve_resistance) != 1)
@@ -176,7 +183,7 @@ void microchannel_config_add_from_strs(microchannel_config_t *config, materials_
  */
 int microchannel_config_to_strs(microchannel_config_t *config, str_pair *table, int max_entries)
 {
-  if (max_entries < 25)
+  if (max_entries < 26)
     fatal("not enough entries in table\n");
 
   sprintf(table[0].name, "cell_width");
@@ -204,6 +211,7 @@ int microchannel_config_to_strs(microchannel_config_t *config, str_pair *table, 
   sprintf(table[22].name, "pump_curve_resistance");
   sprintf(table[23].name, "pump_efficiency");
   sprintf(table[24].name, "manifold_inlet_resistance");
+  sprintf(table[25].name, "closed_branch_mask");
 
   sprintf(table[0].value, "%e", config->cell_width);
   sprintf(table[1].value, "%e", config->cell_height);
@@ -230,8 +238,9 @@ int microchannel_config_to_strs(microchannel_config_t *config, str_pair *table, 
   sprintf(table[22].value, "%e", config->pump_curve_resistance);
   sprintf(table[23].value, "%e", config->pump_efficiency);
   sprintf(table[24].value, "%e", config->manifold_inlet_resistance);
+  sprintf(table[25].value, "%d", config->closed_branch_mask);
 
-  return 25;
+  return 26;
 }
 
 void solve_pressure_circuit(microchannel_config_t *config) {
@@ -471,6 +480,8 @@ void microchannel_build_network(microchannel_config_t *config) {
     return;
   }
   printf("Creating pressure circuit...\n");
+  if(config->closed_branch_mask)
+    fatal("Closed valves require physical straight-duct mode\n");
   build_pressure_matrix(config);
   printf("Solving pressure circuit...\n");
   solve_pressure_circuit(config);
@@ -785,11 +796,11 @@ static void write_hydraulic_report(FILE *stream,
           "HotSpot 7 hydraulic state: network=%s branches=%d "
           "pump_pressure_pa=%.17g total_flow_m3_s=%.17g "
           "pump_power_w=%.17g conservation_error_m3_s=%.17g "
-          "pump_curve_residual_pa=%.17g",
+          "pump_curve_residual_pa=%.17g closed_branch_mask=%d",
           config->network_file, config->cooling_branch_count,
           config->solved_pump_pressure, config->total_flow,
           config->pump_power, config->hydraulic_conservation_error,
-          config->pump_curve_residual);
+          config->pump_curve_residual, config->closed_branch_mask);
   for(branch = 0; branch < config->cooling_branch_count; branch++)
     fprintf(stream, " branch_%d_flow_m3_s=%.17g", branch,
             config->branch_flow[branch]);
@@ -811,7 +822,8 @@ static void solve_physical_straight_ducts(microchannel_config_t *c)
   int *row_branch;
   FILE *report;
   const char *path;
-  if(c->cooling_branch_count != 4 || c->num_columns < 3 || c->num_rows < 1 ||
+  if(c->closed_branch_mask < 0 || c->closed_branch_mask > 15 ||
+     c->cooling_branch_count != 4 || c->num_columns < 3 || c->num_rows < 1 ||
      c->physical_row_flow || !isfinite(c->pumping_pressure) || c->pumping_pressure < 0.)
     fatal("Physical ducts require a fresh four-branch configuration\n");
   duct_g = calloc(c->num_rows, sizeof(double));
@@ -859,7 +871,8 @@ static void solve_physical_straight_ducts(microchannel_config_t *c)
     if(sums[branch] <= 0. || !isfinite(c->valve_resistance[branch]) ||
        c->valve_resistance[branch] <= 0.)
       fatal("Physical duct mode needs four connected finite-resistance valves\n");
-    branch_g[branch] = 1. / (c->valve_resistance[branch] + 1. / sums[branch]);
+    branch_g[branch] = (c->closed_branch_mask & (1 << branch)) ? 0. :
+      1. / (c->valve_resistance[branch] + 1. / sums[branch]);
     total_g += branch_g[branch];
   }
   c->solved_pump_pressure = c->pumping_pressure / (1. + c->pump_curve_resistance * total_g);
@@ -966,6 +979,7 @@ void copy_microchannel(microchannel_config_t *dst, microchannel_config_t *src) {
   dst->pumping_pressure  = src->pumping_pressure;
   dst->pump_internal_res = src->pump_internal_res;
   dst->cooling_branch_count = src->cooling_branch_count;
+  dst->closed_branch_mask = src->closed_branch_mask;
   for(branch = 0; branch < MAX_COOLING_BRANCHES; branch++)
     dst->valve_resistance[branch] = src->valve_resistance[branch];
   dst->pump_curve_resistance = src->pump_curve_resistance;

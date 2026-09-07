@@ -94,6 +94,18 @@ int main(void) {
         assert(near(q, -flow_rate(p, row, 0, row, 1)));
         if(row + 1 < 2 * refinement) assert(flow_rate(p, row, 1, row + 1, 1) == 0.);
       }
+      free(p->physical_row_flow);
+      p->physical_row_flow = NULL;
+      p->closed_branch_mask = 1;
+      solve_physical_straight_ducts(p);
+      assert(p->branch_flow[0] == 0.);
+      assert(p->branch_flow[1] > 0.);
+      free(p->physical_row_flow);
+      p->physical_row_flow = NULL;
+      p->closed_branch_mask = 15;
+      solve_physical_straight_ducts(p);
+      assert(p->total_flow == 0. && p->pump_power == 0.);
+      assert(p->solved_pump_pressure == p->pumping_pressure);
       free_microchannel(p);
     }
     puts("PASS: physical duct flow invariant under 1x/2x/3x refinement");

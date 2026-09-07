@@ -46,6 +46,8 @@ typedef struct microchannel_config_t_st
 
   // Number of independently throttled branches sharing one pump.
   int cooling_branch_count;
+  /* Bit i closes branch i exactly; supported only by physical straight ducts. */
+  int closed_branch_mask;
 
   // Series hydraulic resistance of each branch valve in Pa-s/m^3.
   double valve_resistance[MAX_COOLING_BRANCHES];
