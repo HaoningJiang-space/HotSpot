@@ -468,12 +468,20 @@ void microchannel_build_network(microchannel_config_t *config) {
   solve_pressure_circuit(config);
 }
 
-double hydroC(microchannel_config_t *config) {
+static double edge_hydro_conductance(microchannel_config_t *config,
+                                    int horizontal) {
   double h = config->cell_thickness;
-  double w = config->cell_width;
-  double L = config->cell_height;
+  /* Cross-section is transverse to the edge; length is along the edge.
+   * This cell-network model does not represent transverse refinement of a
+   * single physical duct. Such refinement requires a separate duct model. */
+  double w = horizontal ? config->cell_height : config->cell_width;
+  double L = horizontal ? config->cell_width : config->cell_height;
   double viscosity = config->coolant_visc;
   double ret_val;
+
+  if(!isfinite(h) || !isfinite(w) || !isfinite(L) || !isfinite(viscosity) ||
+     h <= 0 || w <= 0 || L <= 0 || viscosity <= 0)
+    fatal("Invalid hydraulic edge dimensions or viscosity\n");
 
   if(h == w)
     ret_val = (0.42229 * pow(h, 4)) / (12 * viscosity * L);
@@ -556,7 +564,7 @@ void build_pressure_matrix(microchannel_config_t *config) {
 
   // Iterate through all cells
   double diagonal_val = 0;
-  double hydro_conductance = -hydroC(config);
+  double hydro_conductance;
   for(i = 0; i < nr; i++) {
     for(j = 0; j < nc; j++) {
       if(config->cell_types[i][j] == FLUID ||
@@ -564,6 +572,7 @@ void build_pressure_matrix(microchannel_config_t *config) {
           (shared_pump || config->pump_internal_res != 0))) {
         // northern cell
           if(i > 0 && IS_FLUID_CELL(config, i-1, j)) {
+            hydro_conductance = -edge_hydro_conductance(config, FALSE);
             if(DEBUG)
               fprintf(stderr, "[%d, %d]: Northern cell. Setting A[%d][%d] = %.15lf\n", i, j, mapping[i][j], mapping[i-1][j], hydro_conductance);
 
@@ -574,6 +583,7 @@ void build_pressure_matrix(microchannel_config_t *config) {
 
         // southern cell
           if(i < nr - 1 && IS_FLUID_CELL(config, i+1, j)) {
+            hydro_conductance = -edge_hydro_conductance(config, FALSE);
             if(DEBUG)
               fprintf(stderr, "[%d, %d]: Southern cell. Setting A[%d][%d] = %.15lf\n", i, j, mapping[i][j], mapping[i+1][j], hydro_conductance);
 
@@ -584,6 +594,7 @@ void build_pressure_matrix(microchannel_config_t *config) {
 
         // western cell
           if(j > 0 && IS_FLUID_CELL(config, i, j-1)) {
+            hydro_conductance = -edge_hydro_conductance(config, TRUE);
             if(DEBUG)
               fprintf(stderr, "[%d, %d]: Western Cell. Setting A[%d][%d] = %.15lf\n", i, j, mapping[i][j], mapping[i][j-1], hydro_conductance);
 
@@ -594,6 +605,7 @@ void build_pressure_matrix(microchannel_config_t *config) {
 
         // eastern cell
           if(j < nc - 1 && IS_FLUID_CELL(config, i, j+1)) {
+            hydro_conductance = -edge_hydro_conductance(config, TRUE);
             if(DEBUG)
               fprintf(stderr, "[%d, %d]: Eastern Cell. Setting A[%d][%d] = %.15lf\n", i, j, mapping[i][j], mapping[i][j+1], hydro_conductance);
 
@@ -724,7 +736,10 @@ void build_pressure_matrix(microchannel_config_t *config) {
 double flow_rate(microchannel_config_t * config, int cell1_i, int cell1_j, int cell2_i, int cell2_j) {
   double *pressure = config->b;
   int **mapping = config->mapping;
-  return (pressure[mapping[cell1_i][cell1_j]] - pressure[mapping[cell2_i][cell2_j]]) * hydroC(config);
+  if(abs(cell1_i - cell2_i) + abs(cell1_j - cell2_j) != 1)
+    fatal("Hydraulic flow requires adjacent cells\n");
+  return (pressure[mapping[cell1_i][cell1_j]] - pressure[mapping[cell2_i][cell2_j]]) *
+    edge_hydro_conductance(config, cell1_i == cell2_i);
 }
 
 static double inlet_network_flow(microchannel_config_t *config, int row,
