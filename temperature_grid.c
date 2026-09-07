@@ -366,6 +366,57 @@ static void g7_operator_write_matrix(const char *prefix,
     fatal("unable to close HotSpot 7 matrix audit\n");
 }
 
+/* Independent external energy terms, read directly from physical model data.
+ * This is not a row-sum/residual certificate. Currently admitted only for the
+ * no-secondary, physical straight-duct contract used by Contract B. */
+static void g7_export_energy_terms(grid_model_t *model,
+                                   grid_model_vector_t *power, const char *prefix)
+{
+  int l, r, c, index, n = g7_operator_node_count(model);
+  int plane = model->rows * model->cols;
+  int base = model->n_layers * plane;
+  int sink = model->n_layers - DEFAULT_PACK_LAYERS + LAYER_SINK;
+  package_RC_t *pk = &model->pack;
+  FILE *stream;
+  double *ambient_g;
+  if (model->config.model_secondary)
+    return;
+  for (l = 0; l < model->n_layers; l++)
+    if (model->layers[l].is_microchannel &&
+        !model->layers[l].microchannel_config->physical_row_flow)
+      return;
+  ambient_g = calloc(n, sizeof(double));
+  if (!ambient_g) fatal("Energy audit allocation failed\n");
+  for (index = sink * plane; index < (sink+1)*plane; index++)
+    ambient_g[index] = 1. / model->layers[sink].rz;
+  ambient_g[base+SINK_C_W] = ambient_g[base+SINK_C_E] =
+    1. / (pk->r_hs_c_per_x + pk->r_amb_c_per_x);
+  ambient_g[base+SINK_C_N] = ambient_g[base+SINK_C_S] =
+    1. / (pk->r_hs_c_per_y + pk->r_amb_c_per_y);
+  ambient_g[base+SINK_W] = ambient_g[base+SINK_E] =
+    ambient_g[base+SINK_N] = ambient_g[base+SINK_S] =
+    1. / (pk->r_hs_per + pk->r_amb_per);
+  stream = g7_operator_open(prefix, ".energy.tsv", "w");
+  fprintf(stream, "node\tsource_w\tambient_g_w_k\tambient_k\tinlet_w\toutlet_capacity_w_k\n");
+  for (index = 0; index < n; index++) {
+    double source = 0., inlet = 0., outlet = 0.;
+    if (index < base) {
+      l = index / plane; r = (index % plane) / model->cols; c = index % model->cols;
+      source = power->cuboid[l][r][c];
+      if (model->layers[l].is_microchannel) {
+        microchannel_config_t *fluid = model->layers[l].microchannel_config;
+        double capacity_flow = fluid->coolant_capac * fluid->physical_row_flow[r];
+        if (IS_INLET_CELL(fluid, r, c)) inlet = capacity_flow * fluid->inlet_temperature;
+        if (IS_OUTLET_CELL(fluid, r, c)) outlet = capacity_flow;
+      }
+    }
+    fprintf(stream, "%d\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n", index,
+            source, ambient_g[index], model->config.ambient, inlet, outlet);
+  }
+  if (fclose(stream)) fatal("Energy audit close failed\n");
+  free(ambient_g);
+}
+
 static void g7_operator_audit(grid_model_t *model,
                               grid_model_vector_t *power,
                               const SuperMatrix *matrix,
@@ -390,6 +441,7 @@ static void g7_operator_audit(grid_model_t *model,
   if (!model->config.detailed_3D_used)
     fatal("HotSpot 7 operator audit requires detailed-3D mode\n");
   count = g7_operator_node_count(model);
+  g7_export_energy_terms(model, power, prefix);
   if (matrix->nrow != count || matrix->ncol != count)
     fatal("HotSpot 7 operator-audit matrix dimension mismatch\n");
   if (!model->c_ready)
