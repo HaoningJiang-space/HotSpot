@@ -23,6 +23,1258 @@
 #include "slu_ddefs.h"
 #endif
 
+#if SUPERLU > 0
+
+#define G7_OPERATOR_PATH_SIZE 4096
+#define G7_OPERATOR_PROBE_COUNT 8
+
+void slope_fn_grid(grid_model_t *model, double *v,
+                   grid_model_vector_t *p, double *dv);
+void set_heuristic_temp(grid_model_t *model, grid_model_vector_t *power,
+                        grid_model_vector_t *temp);
+double find_res(grid_model_t *model, int n1, int i1, int j1,
+                int n2, int i2, int j2);
+
+static int g7_operator_node_count(grid_model_t *model)
+{
+  int package_nodes = model->config.model_secondary ? EXTRA + EXTRA_SEC : EXTRA;
+  return model->n_layers * model->rows * model->cols + package_nodes;
+}
+
+static FILE *g7_operator_open(const char *prefix, const char *suffix,
+                              const char *mode)
+{
+  char path[G7_OPERATOR_PATH_SIZE];
+  int length = snprintf(path, sizeof(path), "%s%s", prefix, suffix);
+  FILE *stream;
+  if (length < 0 || length >= (int)sizeof(path))
+    fatal("HOTSPOT_G7_OPERATOR_PREFIX is too long\n");
+  stream = fopen(path, mode);
+  if (!stream)
+    fatal("unable to open HotSpot 7 operator-audit output\n");
+  return stream;
+}
+
+static void g7_operator_write_doubles(const char *prefix, const char *suffix,
+                                      const double *values, size_t count)
+{
+  FILE *stream = g7_operator_open(prefix, suffix, "wb");
+  if (fwrite(values, sizeof(double), count, stream) != count) {
+    fclose(stream);
+    fatal("unable to write HotSpot 7 operator-audit output\n");
+  }
+  if (fclose(stream) != 0)
+    fatal("unable to close HotSpot 7 operator-audit output\n");
+}
+
+static void g7_write_state_if_requested(grid_model_t *model)
+{
+  const char *prefix = getenv("HOTSPOT_G7_STATE_PREFIX");
+  if (prefix && prefix[0])
+    g7_operator_write_doubles(prefix, ".state.bin",
+      model->last_steady->cuboid[0][0], g7_operator_node_count(model));
+}
+
+static void g7_operator_build_capacitance(grid_model_t *model, double *cap)
+{
+  int layer, row, column;
+  int nl = model->n_layers;
+  int nr = model->rows;
+  int nc = model->cols;
+  int offset = nl * nr * nc;
+  package_RC_t *pk = &model->pack;
+
+  for (layer = 0; layer < nl; layer++)
+    for (row = 0; row < nr; row++)
+      for (column = 0; column < nc; column++)
+        cap[layer * nr * nc + row * nc + column] =
+          find_cap_3D(layer, row, column, model);
+
+  cap[offset + SP_W] = cap[offset + SP_E] = pk->c_sp_per_x;
+  cap[offset + SP_N] = cap[offset + SP_S] = pk->c_sp_per_y;
+  cap[offset + SINK_C_W] = cap[offset + SINK_C_E] =
+    pk->c_hs_c_per_x + pk->c_amb_c_per_x;
+  cap[offset + SINK_C_N] = cap[offset + SINK_C_S] =
+    pk->c_hs_c_per_y + pk->c_amb_c_per_y;
+  cap[offset + SINK_W] = cap[offset + SINK_E] =
+    pk->c_hs_per + pk->c_amb_per;
+  cap[offset + SINK_N] = cap[offset + SINK_S] =
+    pk->c_hs_per + pk->c_amb_per;
+
+  if (model->config.model_secondary) {
+    cap[offset + SUB_W] = cap[offset + SUB_E] = pk->c_sub_per_x;
+    cap[offset + SUB_N] = cap[offset + SUB_S] = pk->c_sub_per_y;
+    cap[offset + SOLDER_W] = cap[offset + SOLDER_E] = pk->c_solder_per_x;
+    cap[offset + SOLDER_N] = cap[offset + SOLDER_S] = pk->c_solder_per_y;
+    cap[offset + PCB_C_W] = cap[offset + PCB_C_E] =
+      pk->c_pcb_c_per_x + pk->c_amb_sec_c_per_x;
+    cap[offset + PCB_C_N] = cap[offset + PCB_C_S] =
+      pk->c_pcb_c_per_y + pk->c_amb_sec_c_per_y;
+    cap[offset + PCB_W] = cap[offset + PCB_E] =
+      pk->c_pcb_per + pk->c_amb_sec_per;
+    cap[offset + PCB_N] = cap[offset + PCB_S] =
+      pk->c_pcb_per + pk->c_amb_sec_per;
+  }
+}
+
+static void g7_operator_residual(grid_model_t *model,
+                                 grid_model_vector_t *power,
+                                 const double *cap, const double *state,
+                                 double *residual)
+{
+  int count = g7_operator_node_count(model);
+  int index;
+  slope_fn_grid(model, (double *)state, power, residual);
+  for (index = 0; index < count; index++)
+    residual[index] *= cap[index];
+}
+
+static void g7_operator_matvec(grid_model_t *model,
+                               grid_model_vector_t *power,
+                               const double *cap, const double *rhs,
+                               const double *input, double *product,
+                               double *scaled)
+{
+  int count = g7_operator_node_count(model);
+  int index;
+  double magnitude = 0.0;
+  double scale;
+  for (index = 0; index < count; index++)
+    magnitude = MAX(magnitude, fabs(input[index]));
+  if (magnitude == 0.0) {
+    zero_dvector(product, count);
+    return;
+  }
+  scale = 1.0 / magnitude;
+  for (index = 0; index < count; index++)
+    scaled[index] = input[index] * scale;
+  g7_operator_residual(model, power, cap, scaled, product);
+  for (index = 0; index < count; index++)
+    product[index] = (rhs[index] - product[index]) / scale;
+}
+
+static double g7_operator_flow_diagonal(grid_model_t *model, int layer,
+                                        int row, int column)
+{
+  microchannel_config_t *config;
+  double coefficient = 0.0;
+  int nr = model->rows;
+  int nc = model->cols;
+  if (!model->layers[layer].is_microchannel)
+    return 0.0;
+  config = model->layers[layer].microchannel_config;
+  if (IS_OUTLET_CELL(config, row, column)) {
+    if (row > 0 && IS_FLUID_CELL(config, row - 1, column))
+      coefficient = config->coolant_capac *
+        flow_rate(config, row - 1, column, row, column) / 2.0;
+    else if (row + 1 < nr && IS_FLUID_CELL(config, row + 1, column))
+      coefficient = config->coolant_capac *
+        flow_rate(config, row + 1, column, row, column) / 2.0;
+    else if (column > 0 && IS_FLUID_CELL(config, row, column - 1))
+      coefficient = config->coolant_capac *
+        flow_rate(config, row, column - 1, row, column) / 2.0;
+    else if (column + 1 < nc && IS_FLUID_CELL(config, row, column + 1))
+      coefficient = config->coolant_capac *
+        flow_rate(config, row, column + 1, row, column) / 2.0;
+  } else if (IS_FLUID_CELL(config, row, column)) {
+    if (row > 0 && IS_FLUID_CELL(config, row - 1, column))
+      coefficient += config->coolant_capac *
+        flow_rate(config, row, column, row - 1, column) / 2.0;
+    if (row + 1 < nr && IS_FLUID_CELL(config, row + 1, column))
+      coefficient += config->coolant_capac *
+        flow_rate(config, row, column, row + 1, column) / 2.0;
+    if (column > 0 && IS_FLUID_CELL(config, row, column - 1))
+      coefficient += config->coolant_capac *
+        flow_rate(config, row, column, row, column - 1) / 2.0;
+    if (column + 1 < nc && IS_FLUID_CELL(config, row, column + 1))
+      coefficient += config->coolant_capac *
+        flow_rate(config, row, column, row, column + 1) / 2.0;
+  }
+  return coefficient;
+}
+
+static void g7_operator_build_diagonal(grid_model_t *model,
+                                       grid_model_vector_t *power,
+                                       const double *cap, const double *rhs,
+                                       double *diagonal, double *basis,
+                                       double *work, double *scaled)
+{
+  int layer, row, column, index;
+  int nl = model->n_layers;
+  int nr = model->rows;
+  int nc = model->cols;
+  int grid_nodes = nl * nr * nc;
+  int count = g7_operator_node_count(model);
+  int spidx = nl - DEFAULT_PACK_LAYERS + LAYER_SP;
+  int hsidx = nl - DEFAULT_PACK_LAYERS + LAYER_SINK;
+  double cw = model->width / nc;
+  double ch = model->height / nr;
+  layer_t *layers = model->layers;
+
+  for (layer = 0; layer < nl; layer++)
+    for (row = 0; row < nr; row++)
+      for (column = 0; column < nc; column++) {
+        double value = 0.0;
+        index = layer * nr * nc + row * nc + column;
+        if (row > 0)
+          value += 1.0 / find_res(model, layer, row - 1, column,
+                                  layer, row, column);
+        if (row + 1 < nr)
+          value += 1.0 / find_res(model, layer, row + 1, column,
+                                  layer, row, column);
+        if (column > 0)
+          value += 1.0 / find_res(model, layer, row, column - 1,
+                                  layer, row, column);
+        if (column + 1 < nc)
+          value += 1.0 / find_res(model, layer, row, column + 1,
+                                  layer, row, column);
+        if (layer > 0)
+          value += 1.0 / find_res(model, layer - 1, row, column,
+                                  layer, row, column);
+        if (layer + 1 < nl)
+          value += 1.0 / find_res(model, layer + 1, row, column,
+                                  layer, row, column);
+        if (layer == spidx) {
+          if (row == 0 || row == nr - 1)
+            value += 1.0 / (layers[layer].ry / 2.0 +
+                            nc * model->pack.r_sp1_y);
+          if (column == 0 || column == nc - 1)
+            value += 1.0 / (layers[layer].rx / 2.0 +
+                            nr * model->pack.r_sp1_x);
+        } else if (layer == hsidx) {
+          value += 1.0 / layers[layer].rz;
+          if (row == 0 || row == nr - 1)
+            value += 1.0 / (layers[layer].ry / 2.0 +
+                            nc * model->pack.r_hs1_y);
+          if (column == 0 || column == nc - 1)
+            value += 1.0 / (layers[layer].rx / 2.0 +
+                            nr * model->pack.r_hs1_x);
+        } else if (model->config.model_secondary && layer == LAYER_SUB) {
+          if (row == 0 || row == nr - 1)
+            value += 1.0 / (layers[layer].ry / 2.0 +
+                            nc * model->pack.r_sub1_y);
+          if (column == 0 || column == nc - 1)
+            value += 1.0 / (layers[layer].rx / 2.0 +
+                            nr * model->pack.r_sub1_x);
+        } else if (model->config.model_secondary && layer == LAYER_SOLDER) {
+          if (row == 0 || row == nr - 1)
+            value += 1.0 / (layers[layer].ry / 2.0 +
+                            nc * model->pack.r_solder1_y);
+          if (column == 0 || column == nc - 1)
+            value += 1.0 / (layers[layer].rx / 2.0 +
+                            nr * model->pack.r_solder1_x);
+        } else if (model->config.model_secondary && layer == LAYER_PCB) {
+          value += 1.0 / (model->config.r_convec_sec *
+                          model->config.s_pcb * model->config.s_pcb /
+                          (cw * ch));
+          if (row == 0 || row == nr - 1)
+            value += 1.0 / (layers[layer].ry / 2.0 +
+                            nc * model->pack.r_pcb1_y);
+          if (column == 0 || column == nc - 1)
+            value += 1.0 / (layers[layer].rx / 2.0 +
+                            nr * model->pack.r_pcb1_x);
+        }
+        diagonal[index] = value +
+          g7_operator_flow_diagonal(model, layer, row, column);
+      }
+
+  for (index = grid_nodes; index < count; index++) {
+    zero_dvector(basis, count);
+    basis[index] = 1.0;
+    g7_operator_matvec(model, power, cap, rhs, basis, work, scaled);
+    diagonal[index] = work[index];
+  }
+  for (index = 0; index < count; index++)
+    if (!(diagonal[index] > 0.0) || !isfinite(diagonal[index]))
+      fatal("HotSpot 7 Krylov found invalid Jacobi diagonal\n");
+}
+
+static double g7_operator_max_flow(grid_model_t *model)
+{
+  double maximum = 0.0;
+  int layer, row, column;
+  for (layer = 0; layer < model->n_layers; layer++) {
+    microchannel_config_t *config;
+    if (!model->layers[layer].is_microchannel)
+      continue;
+    config = model->layers[layer].microchannel_config;
+    for (row = 0; row < model->rows; row++)
+      for (column = 0; column < model->cols; column++) {
+        if (!IS_FLUID_CELL(config, row, column))
+          continue;
+        if (row + 1 < model->rows &&
+            IS_FLUID_CELL(config, row + 1, column))
+          maximum = MAX(maximum, fabs(flow_rate(config, row, column,
+                                                row + 1, column)));
+        if (column + 1 < model->cols &&
+            IS_FLUID_CELL(config, row, column + 1))
+          maximum = MAX(maximum, fabs(flow_rate(config, row, column,
+                                                row, column + 1)));
+      }
+  }
+  return maximum;
+}
+
+static void g7_operator_csc_matvec(const SuperMatrix *matrix,
+                                   const double *input, double *product)
+{
+  NCformat *store = (NCformat *)matrix->Store;
+  double *values = (double *)store->nzval;
+  int_t *rows = store->rowind;
+  int_t *columns = store->colptr;
+  int column;
+  int_t index;
+  zero_dvector(product, matrix->nrow);
+  for (column = 0; column < matrix->ncol; column++)
+    for (index = columns[column]; index < columns[column + 1]; index++)
+      product[rows[index]] += values[index] * input[column];
+}
+
+static void g7_operator_build_probes(double *probes, int count)
+{
+  int index;
+  for (index = 0; index < count; index++) {
+    double sign = (index & 1) ? -1.0 : 1.0;
+    probes[0 * count + index] = sign * (1.0 + (double)(index % 7));
+    probes[1 * count + index] = 280.0 + (double)(index % 19) / 2.0;
+    probes[2 * count + index] = (double)(index % 17 - 8);
+    probes[3 * count + index] = sin((double)(index + 1) * 0.173);
+    probes[4 * count + index] = sign * (index % 3 == 0 ? 1.0e-12 :
+                                        (index % 3 == 1 ? 1.0 : 1.0e12));
+    probes[5 * count + index] = (double)((index * 37) % 101 - 50) / 8.0;
+    probes[6 * count + index] = index == 0 ? 1.0 : 0.0;
+    probes[7 * count + index] = index == count - 1 ? 1.0 : 0.0;
+  }
+}
+
+static void g7_operator_write_matrix(const char *prefix,
+                                     const SuperMatrix *matrix)
+{
+  NCformat *store = (NCformat *)matrix->Store;
+  double *values = (double *)store->nzval;
+  int_t *rows = store->rowind;
+  int_t *columns = store->colptr;
+  int column;
+  int_t index;
+  FILE *stream = g7_operator_open(prefix, ".matrix.coo.tsv", "w");
+  fprintf(stream, "row\tcolumn\tvalue\n");
+  for (column = 0; column < matrix->ncol; column++)
+    for (index = columns[column]; index < columns[column + 1]; index++)
+      fprintf(stream, "%d\t%d\t%.17g\n", (int)rows[index], column,
+              values[index]);
+  if (fclose(stream) != 0)
+    fatal("unable to close HotSpot 7 matrix audit\n");
+}
+
+static void g7_operator_audit(grid_model_t *model,
+                              grid_model_vector_t *power,
+                              const SuperMatrix *matrix,
+                              const double *assembled_rhs)
+{
+  const char *prefix = getenv("HOTSPOT_G7_OPERATOR_PREFIX");
+  int count;
+  int probe_index, index;
+  int input_mutations = 0;
+  double rhs_diff_norm, rhs_norm;
+  double max_action_abs_error = 0.0;
+  double max_action_relative_l2 = 0.0;
+  double max_diagonal_relative_error = 0.0;
+  double *cap, *zero, *native_rhs, *probes, *input_copy;
+  double *matrix_free_actions, *assembled_actions, *scaled;
+  double *diagonal, *basis, *work;
+  FILE *metadata;
+  NCformat *store;
+
+  if (!prefix || !prefix[0])
+    return;
+  if (!model->config.detailed_3D_used)
+    fatal("HotSpot 7 operator audit requires detailed-3D mode\n");
+  count = g7_operator_node_count(model);
+  if (matrix->nrow != count || matrix->ncol != count)
+    fatal("HotSpot 7 operator-audit matrix dimension mismatch\n");
+  if (!model->c_ready)
+    populate_C_model_grid(model, NULL);
+
+  cap = (double *)calloc(count, sizeof(double));
+  zero = (double *)calloc(count, sizeof(double));
+  native_rhs = (double *)calloc(count, sizeof(double));
+  probes = (double *)calloc((size_t)G7_OPERATOR_PROBE_COUNT * count,
+                            sizeof(double));
+  input_copy = (double *)calloc(count, sizeof(double));
+  matrix_free_actions = (double *)calloc(
+    (size_t)G7_OPERATOR_PROBE_COUNT * count, sizeof(double));
+  assembled_actions = (double *)calloc(
+    (size_t)G7_OPERATOR_PROBE_COUNT * count, sizeof(double));
+  scaled = (double *)calloc(count, sizeof(double));
+  diagonal = (double *)calloc(count, sizeof(double));
+  basis = (double *)calloc(count, sizeof(double));
+  work = (double *)calloc(count, sizeof(double));
+  if (!cap || !zero || !native_rhs || !probes || !input_copy ||
+      !matrix_free_actions || !assembled_actions || !scaled || !diagonal ||
+      !basis || !work)
+    fatal("HotSpot 7 operator-audit allocation failed\n");
+
+  g7_operator_build_capacitance(model, cap);
+  for (index = 0; index < count; index++)
+    if (!(cap[index] > 0.0) || !isfinite(cap[index]))
+      fatal("HotSpot 7 operator audit found invalid capacitance\n");
+  g7_operator_residual(model, power, cap, zero, native_rhs);
+  rhs_diff_norm = 0.0;
+  rhs_norm = 0.0;
+  for (index = 0; index < count; index++) {
+    double difference = native_rhs[index] - assembled_rhs[index];
+    rhs_diff_norm += difference * difference;
+    rhs_norm += assembled_rhs[index] * assembled_rhs[index];
+  }
+
+  g7_operator_build_probes(probes, count);
+  for (probe_index = 0; probe_index < G7_OPERATOR_PROBE_COUNT;
+       probe_index++) {
+    double difference_norm = 0.0;
+    double reference_norm = 0.0;
+    double *input = &probes[(size_t)probe_index * count];
+    double *matrix_free = &matrix_free_actions[(size_t)probe_index * count];
+    double *assembled = &assembled_actions[(size_t)probe_index * count];
+    memcpy(input_copy, input, (size_t)count * sizeof(double));
+    g7_operator_matvec(model, power, cap, native_rhs, input, matrix_free,
+                       scaled);
+    if (memcmp(input_copy, input, (size_t)count * sizeof(double)) != 0)
+      input_mutations++;
+    g7_operator_csc_matvec(matrix, input, assembled);
+    for (index = 0; index < count; index++) {
+      double difference = matrix_free[index] - assembled[index];
+      max_action_abs_error = MAX(max_action_abs_error, fabs(difference));
+      difference_norm += difference * difference;
+      reference_norm += assembled[index] * assembled[index];
+    }
+    if (reference_norm > 0.0)
+      max_action_relative_l2 = MAX(max_action_relative_l2,
+        sqrt(difference_norm / reference_norm));
+  }
+
+  store = (NCformat *)matrix->Store;
+  g7_operator_build_diagonal(model, power, cap, native_rhs, diagonal,
+                             basis, work, scaled);
+  for (index = 0; index < count; index++) {
+    double explicit_diagonal = 0.0;
+    int_t entry;
+    for (entry = store->colptr[index]; entry < store->colptr[index + 1];
+         entry++)
+      if (store->rowind[entry] == index) {
+        explicit_diagonal += ((double *)store->nzval)[entry];
+      }
+    if (explicit_diagonal != 0.0)
+      max_diagonal_relative_error = MAX(max_diagonal_relative_error,
+        fabs(diagonal[index] - explicit_diagonal) /
+        fabs(explicit_diagonal));
+    else if (diagonal[index] != 0.0)
+      max_diagonal_relative_error = INFINITY;
+  }
+  g7_operator_write_matrix(prefix, matrix);
+  g7_operator_write_doubles(prefix, ".rhs.bin", assembled_rhs, count);
+  g7_operator_write_doubles(prefix, ".native-rhs.bin", native_rhs, count);
+  g7_operator_write_doubles(prefix, ".probes.bin", probes,
+                            (size_t)G7_OPERATOR_PROBE_COUNT * count);
+  g7_operator_write_doubles(prefix, ".matrix-free-actions.bin",
+                            matrix_free_actions,
+                            (size_t)G7_OPERATOR_PROBE_COUNT * count);
+  g7_operator_write_doubles(prefix, ".assembled-actions.bin",
+                            assembled_actions,
+                            (size_t)G7_OPERATOR_PROBE_COUNT * count);
+  g7_operator_write_doubles(prefix, ".jacobi.bin", diagonal, count);
+  metadata = g7_operator_open(prefix, ".meta", "w");
+  fprintf(metadata, "format=hotspot-g7-operator-v1\n");
+  fprintf(metadata, "node_count=%d\n", count);
+  fprintf(metadata, "nnz=%d\n", (int)store->nnz);
+  fprintf(metadata, "probe_count=%d\n", G7_OPERATOR_PROBE_COUNT);
+  fprintf(metadata, "microchannels=%d\n", model->use_microchannels);
+  fprintf(metadata, "rhs_relative_l2=%.17g\n",
+          rhs_norm > 0.0 ? sqrt(rhs_diff_norm / rhs_norm) :
+          sqrt(rhs_diff_norm));
+  fprintf(metadata, "action_max_abs_error=%.17g\n",
+          max_action_abs_error);
+  fprintf(metadata, "action_max_relative_l2=%.17g\n",
+          max_action_relative_l2);
+  fprintf(metadata, "jacobi_max_relative_error=%.17g\n",
+          max_diagonal_relative_error);
+  fprintf(metadata, "input_mutations=%d\n", input_mutations);
+  if (fclose(metadata) != 0)
+    fatal("unable to close HotSpot 7 operator metadata\n");
+
+  free(cap);
+  free(zero);
+  free(native_rhs);
+  free(probes);
+  free(input_copy);
+  free(matrix_free_actions);
+  free(assembled_actions);
+  free(scaled);
+  free(diagonal);
+  free(basis);
+  free(work);
+  if (input_mutations != 0)
+    fatal("HotSpot 7 matrix-free operator modified an input probe\n");
+}
+
+#define G7_KRYLOV_MAX_ITERATIONS 5000
+#define G7_GMRES_RESTART 40
+
+static double g7_krylov_dot(const double *left, const double *right, int count)
+{
+  double result = 0.0;
+  int index;
+  for (index = 0; index < count; index++)
+    result += left[index] * right[index];
+  return result;
+}
+
+static double g7_krylov_norm(const double *value, int count)
+{
+  return sqrt(g7_krylov_dot(value, value, count));
+}
+
+static double g7_krylov_tolerance(void)
+{
+  const char *text = getenv("HOTSPOT_G7_RELATIVE_RESIDUAL");
+  double tolerance = text && text[0] ? atof(text) : 1.0e-8;
+  if (!(tolerance > 0.0) || !isfinite(tolerance))
+    fatal("invalid HOTSPOT_G7_RELATIVE_RESIDUAL\n");
+  return tolerance;
+}
+
+static int g7_pcg_solve(grid_model_t *model, grid_model_vector_t *power,
+                        const double *cap, const double *rhs,
+                        const double *diagonal, double *state,
+                        double *scaled, double tolerance,
+                        double *final_relative_residual)
+{
+  int count = g7_operator_node_count(model);
+  int index, iteration;
+  double rhs_norm = g7_krylov_norm(rhs, count);
+  double residual_norm, rho, next_rho, alpha, beta, pap;
+  double *residual = (double *)calloc(count, sizeof(double));
+  double *preconditioned = (double *)calloc(count, sizeof(double));
+  double *direction = (double *)calloc(count, sizeof(double));
+  double *product = (double *)calloc(count, sizeof(double));
+  if (!residual || !preconditioned || !direction || !product)
+    fatal("HotSpot 7 PCG allocation failed\n");
+  if (!(rhs_norm > 0.0) || !isfinite(rhs_norm))
+    fatal("HotSpot 7 PCG found invalid right-hand side\n");
+
+  g7_operator_residual(model, power, cap, state, residual);
+  residual_norm = g7_krylov_norm(residual, count);
+  if (residual_norm <= tolerance * rhs_norm) {
+    *final_relative_residual = residual_norm / rhs_norm;
+    free(residual); free(preconditioned); free(direction); free(product);
+    return 0;
+  }
+  for (index = 0; index < count; index++) {
+    preconditioned[index] = residual[index] / diagonal[index];
+    direction[index] = preconditioned[index];
+  }
+  rho = g7_krylov_dot(residual, preconditioned, count);
+  if (!(rho > 0.0) || !isfinite(rho))
+    fatal("HotSpot 7 PCG found non-positive initial energy\n");
+
+  for (iteration = 0; iteration < G7_KRYLOV_MAX_ITERATIONS; iteration++) {
+    g7_operator_matvec(model, power, cap, rhs, direction, product, scaled);
+    pap = g7_krylov_dot(direction, product, count);
+    if (!(pap > 0.0) || !isfinite(pap))
+      fatal("HotSpot 7 PCG encountered non-positive direction\n");
+    alpha = rho / pap;
+    for (index = 0; index < count; index++) {
+      state[index] += alpha * direction[index];
+      residual[index] -= alpha * product[index];
+    }
+    residual_norm = g7_krylov_norm(residual, count);
+    if (residual_norm <= tolerance * rhs_norm) {
+      g7_operator_residual(model, power, cap, state, residual);
+      residual_norm = g7_krylov_norm(residual, count);
+      if (residual_norm <= tolerance * rhs_norm) {
+        iteration++;
+        break;
+      }
+      for (index = 0; index < count; index++) {
+        preconditioned[index] = residual[index] / diagonal[index];
+        direction[index] = preconditioned[index];
+      }
+      rho = g7_krylov_dot(residual, preconditioned, count);
+      continue;
+    }
+    for (index = 0; index < count; index++)
+      preconditioned[index] = residual[index] / diagonal[index];
+    next_rho = g7_krylov_dot(residual, preconditioned, count);
+    if (!(next_rho > 0.0) || !isfinite(next_rho))
+      fatal("HotSpot 7 PCG found invalid residual energy\n");
+    beta = next_rho / rho;
+    for (index = 0; index < count; index++)
+      direction[index] = preconditioned[index] + beta * direction[index];
+    rho = next_rho;
+  }
+  if (iteration >= G7_KRYLOV_MAX_ITERATIONS) {
+    g7_operator_residual(model, power, cap, state, residual);
+    residual_norm = g7_krylov_norm(residual, count);
+  }
+  *final_relative_residual = residual_norm / rhs_norm;
+  free(residual); free(preconditioned); free(direction); free(product);
+  return iteration;
+}
+
+static int g7_gmres_solve(grid_model_t *model, grid_model_vector_t *power,
+                          const double *cap, const double *rhs,
+                          const double *diagonal, double *state,
+                          double *scaled, double tolerance,
+                          double *final_relative_residual)
+{
+  int count = g7_operator_node_count(model);
+  int restart = G7_GMRES_RESTART;
+  int total_iterations = 0;
+  int index, row, column, used;
+  double rhs_norm = g7_krylov_norm(rhs, count);
+  double residual_norm;
+  double *residual = (double *)calloc(count, sizeof(double));
+  double *work = (double *)calloc(count, sizeof(double));
+  double *basis = (double *)calloc((size_t)(restart + 1) * count,
+                                   sizeof(double));
+  double *hessenberg = (double *)calloc((size_t)(restart + 1) * restart,
+                                        sizeof(double));
+  double *cosines = (double *)calloc(restart, sizeof(double));
+  double *sines = (double *)calloc(restart, sizeof(double));
+  double *g = (double *)calloc(restart + 1, sizeof(double));
+  double *solution = (double *)calloc(restart, sizeof(double));
+  if (!residual || !work || !basis || !hessenberg || !cosines || !sines ||
+      !g || !solution)
+    fatal("HotSpot 7 GMRES allocation failed\n");
+  if (!(rhs_norm > 0.0) || !isfinite(rhs_norm))
+    fatal("HotSpot 7 GMRES found invalid right-hand side\n");
+
+  while (total_iterations < G7_KRYLOV_MAX_ITERATIONS) {
+    double beta;
+    g7_operator_residual(model, power, cap, state, residual);
+    residual_norm = g7_krylov_norm(residual, count);
+    if (residual_norm <= tolerance * rhs_norm)
+      break;
+    for (index = 0; index < count; index++)
+      residual[index] /= diagonal[index];
+    beta = g7_krylov_norm(residual, count);
+    if (!(beta > 0.0) || !isfinite(beta))
+      fatal("HotSpot 7 GMRES found invalid preconditioned residual\n");
+    memset(hessenberg, 0,
+           (size_t)(restart + 1) * restart * sizeof(double));
+    memset(cosines, 0, (size_t)restart * sizeof(double));
+    memset(sines, 0, (size_t)restart * sizeof(double));
+    memset(g, 0, (size_t)(restart + 1) * sizeof(double));
+    g[0] = beta;
+    for (index = 0; index < count; index++)
+      basis[index] = residual[index] / beta;
+
+    used = 0;
+    for (column = 0; column < restart &&
+         total_iterations < G7_KRYLOV_MAX_ITERATIONS; column++) {
+      double next_norm, rotation_norm;
+      double *current = &basis[(size_t)column * count];
+      double *next = &basis[(size_t)(column + 1) * count];
+      g7_operator_matvec(model, power, cap, rhs, current, work, scaled);
+      for (index = 0; index < count; index++)
+        work[index] /= diagonal[index];
+      for (row = 0; row <= column; row++) {
+        double *previous = &basis[(size_t)row * count];
+        double value = g7_krylov_dot(work, previous, count);
+        hessenberg[(size_t)row * restart + column] = value;
+        for (index = 0; index < count; index++)
+          work[index] -= value * previous[index];
+      }
+      next_norm = g7_krylov_norm(work, count);
+      hessenberg[(size_t)(column + 1) * restart + column] = next_norm;
+      if (next_norm > 0.0 && isfinite(next_norm))
+        for (index = 0; index < count; index++)
+          next[index] = work[index] / next_norm;
+
+      for (row = 0; row < column; row++) {
+        double upper = hessenberg[(size_t)row * restart + column];
+        double lower = hessenberg[(size_t)(row + 1) * restart + column];
+        hessenberg[(size_t)row * restart + column] =
+          cosines[row] * upper + sines[row] * lower;
+        hessenberg[(size_t)(row + 1) * restart + column] =
+          -sines[row] * upper + cosines[row] * lower;
+      }
+      rotation_norm = hypot(
+        hessenberg[(size_t)column * restart + column],
+        hessenberg[(size_t)(column + 1) * restart + column]);
+      if (!(rotation_norm > 0.0) || !isfinite(rotation_norm))
+        fatal("HotSpot 7 GMRES encountered singular Hessenberg column\n");
+      cosines[column] =
+        hessenberg[(size_t)column * restart + column] / rotation_norm;
+      sines[column] =
+        hessenberg[(size_t)(column + 1) * restart + column] / rotation_norm;
+      hessenberg[(size_t)column * restart + column] = rotation_norm;
+      hessenberg[(size_t)(column + 1) * restart + column] = 0.0;
+      {
+        double upper = g[column];
+        double lower = g[column + 1];
+        g[column] = cosines[column] * upper + sines[column] * lower;
+        g[column + 1] = -sines[column] * upper + cosines[column] * lower;
+      }
+      used = column + 1;
+      total_iterations++;
+      if (next_norm == 0.0 ||
+          fabs(g[column + 1]) <= tolerance * beta)
+        break;
+    }
+
+    for (row = used - 1; row >= 0; row--) {
+      double value = g[row];
+      for (column = row + 1; column < used; column++)
+        value -= hessenberg[(size_t)row * restart + column] *
+          solution[column];
+      solution[row] = value /
+        hessenberg[(size_t)row * restart + row];
+    }
+    for (row = 0; row < used; row++) {
+      double *vector = &basis[(size_t)row * count];
+      for (index = 0; index < count; index++)
+        state[index] += solution[row] * vector[index];
+    }
+  }
+  g7_operator_residual(model, power, cap, state, residual);
+  residual_norm = g7_krylov_norm(residual, count);
+  *final_relative_residual = residual_norm / rhs_norm;
+  free(residual); free(work); free(basis); free(hessenberg);
+  free(cosines); free(sines); free(g); free(solution);
+  return total_iterations;
+}
+
+typedef struct g7_fluid_factor_t_st {
+  int full_count;
+  int fluid_count;
+  int *full_to_fluid;
+  int *fluid_to_full;
+  int *perm_r;
+  int *perm_c;
+  SuperMatrix L;
+  SuperMatrix U;
+  double response_diagonal_sum;
+  double response_diagonal_max;
+  int ready;
+} g7_fluid_factor_t;
+
+typedef struct g7_partition_context_t_st {
+  grid_model_t *model;
+  grid_model_vector_t *power;
+  const double *cap;
+  const double *rhs;
+  const double *diagonal;
+  double *scaled;
+  int solid_pcg_steps;
+  int exact_solid;
+  g7_fluid_factor_t fluid;
+  g7_fluid_factor_t solid_factor;
+  double *inner_residual;
+  double *inner_preconditioned;
+  double *inner_direction;
+  double *inner_product;
+  double *block_action;
+  double *fluid_rhs;
+  double *solid_rhs;
+  double *solid_solution;
+} g7_partition_context_t;
+
+static int g7_is_fluid_layer_node(grid_model_t *model, int index)
+{
+  int plane = model->rows * model->cols;
+  int grid_nodes = model->n_layers * plane;
+  return index < grid_nodes && model->layers[index / plane].is_microchannel;
+}
+
+static void g7_fluid_factor_free(g7_fluid_factor_t *factor)
+{
+  if (factor->ready) {
+    Destroy_SuperNode_Matrix(&factor->L);
+    Destroy_CompCol_Matrix(&factor->U);
+  }
+  if (factor->perm_r)
+    SUPERLU_FREE(factor->perm_r);
+  if (factor->perm_c)
+    SUPERLU_FREE(factor->perm_c);
+  free(factor->full_to_fluid);
+  free(factor->fluid_to_full);
+  memset(factor, 0, sizeof(*factor));
+}
+
+static void g7_fluid_factor_build(g7_fluid_factor_t *factor,
+                                  grid_model_t *model,
+                                  SuperMatrix *assembled,
+                                  const double *full_diagonal,
+                                  int select_fluid)
+{
+  int full_count = g7_operator_node_count(model);
+  int full_column, full_row, local_column, local_row;
+  int fluid_count = 0;
+  int nnz = 0;
+  int cursor = 0;
+  int info;
+  double *values;
+  int *rows;
+  int *columns;
+  double *dummy;
+  SuperMatrix fluid_matrix, dense;
+  NCformat *store = (NCformat *)assembled->Store;
+  superlu_options_t options;
+  SuperLUStat_t stat;
+  const char *schur_text = getenv("HOTSPOT_G7_LOCAL_SCHUR");
+  int use_jacobi_response = select_fluid && schur_text &&
+    !strcmp(schur_text, "jacobi_diag");
+
+  memset(factor, 0, sizeof(*factor));
+  factor->full_count = full_count;
+  factor->full_to_fluid = (int *)malloc((size_t)full_count * sizeof(int));
+  if (!factor->full_to_fluid)
+    fatal("HotSpot 7 fluid-factor mapping allocation failed\n");
+  for (full_column = 0; full_column < full_count; full_column++) {
+    int is_fluid = g7_is_fluid_layer_node(model, full_column);
+    if ((select_fluid && is_fluid) || (!select_fluid && !is_fluid))
+      factor->full_to_fluid[full_column] = fluid_count++;
+    else
+      factor->full_to_fluid[full_column] = -1;
+  }
+  if (fluid_count == 0)
+    fatal("HotSpot 7 partitioned solver found no microchannel layer\n");
+  factor->fluid_count = fluid_count;
+  factor->fluid_to_full = (int *)malloc((size_t)fluid_count * sizeof(int));
+  if (!factor->fluid_to_full)
+    fatal("HotSpot 7 fluid-factor inverse mapping allocation failed\n");
+  for (full_column = 0; full_column < full_count; full_column++)
+    if (factor->full_to_fluid[full_column] >= 0)
+      factor->fluid_to_full[factor->full_to_fluid[full_column]] = full_column;
+
+  for (full_column = 0; full_column < full_count; full_column++)
+    if (factor->full_to_fluid[full_column] >= 0)
+      for (full_row = store->colptr[full_column];
+           full_row < store->colptr[full_column + 1]; full_row++)
+        if (factor->full_to_fluid[store->rowind[full_row]] >= 0)
+          nnz++;
+  values = doubleMalloc(nnz);
+  rows = intMalloc(nnz);
+  columns = intMalloc(fluid_count + 1);
+  dummy = (double *)calloc((size_t)fluid_count, sizeof(double));
+  factor->perm_r = intMalloc(fluid_count);
+  factor->perm_c = intMalloc(fluid_count);
+  if (!values || !rows || !columns || !dummy || !factor->perm_r ||
+      !factor->perm_c)
+    fatal("HotSpot 7 fluid-factor storage allocation failed\n");
+
+  columns[0] = 0;
+  local_column = 0;
+  for (full_column = 0; full_column < full_count; full_column++) {
+    double response_diagonal = 0.0;
+    if (factor->full_to_fluid[full_column] < 0)
+      continue;
+    if (use_jacobi_response) {
+      for (full_row = store->colptr[full_column];
+           full_row < store->colptr[full_column + 1]; full_row++) {
+        int coupled = store->rowind[full_row];
+        if (factor->full_to_fluid[coupled] < 0) {
+          double coupling = ((double *)store->nzval)[full_row];
+          if (!(full_diagonal[coupled] > 0.0) ||
+              !isfinite(full_diagonal[coupled]))
+            fatal("HotSpot 7 local Schur found invalid solid diagonal\n");
+          response_diagonal += coupling * coupling /
+            full_diagonal[coupled];
+        }
+      }
+      factor->response_diagonal_sum += response_diagonal;
+      if (response_diagonal > factor->response_diagonal_max)
+        factor->response_diagonal_max = response_diagonal;
+    }
+    for (full_row = store->colptr[full_column];
+         full_row < store->colptr[full_column + 1]; full_row++) {
+      local_row = factor->full_to_fluid[store->rowind[full_row]];
+      if (local_row >= 0) {
+        values[cursor] = ((double *)store->nzval)[full_row];
+        if (use_jacobi_response && local_row == local_column)
+          values[cursor] -= response_diagonal;
+        rows[cursor++] = local_row;
+      }
+    }
+    columns[++local_column] = cursor;
+  }
+  if (cursor != nnz || local_column != fluid_count)
+    fatal("HotSpot 7 fluid-factor extraction failed\n");
+
+  dCreate_CompCol_Matrix(&fluid_matrix, fluid_count, fluid_count, nnz,
+                         values, rows, columns, SLU_NC, SLU_D, SLU_GE);
+  dCreate_Dense_Matrix(&dense, fluid_count, 1, dummy, fluid_count,
+                       SLU_DN, SLU_D, SLU_GE);
+  set_default_options(&options);
+  StatInit(&stat);
+  dgssv(&options, &fluid_matrix, factor->perm_c, factor->perm_r,
+        &factor->L, &factor->U, &dense, &stat, &info);
+  StatFree(&stat);
+  Destroy_CompCol_Matrix(&fluid_matrix);
+  Destroy_SuperMatrix_Store(&dense);
+  SUPERLU_FREE(dummy);
+  if (info != 0)
+    fatal("HotSpot 7 fluid-block factorization failed\n");
+  factor->ready = 1;
+}
+
+static void g7_fluid_factor_solve(g7_fluid_factor_t *factor,
+                                  const double *rhs, double *solution)
+{
+  int info;
+  SuperMatrix dense;
+  SuperLUStat_t stat;
+  memcpy(solution, rhs, (size_t)factor->fluid_count * sizeof(double));
+  dCreate_Dense_Matrix(&dense, factor->fluid_count, 1, solution,
+                       factor->fluid_count, SLU_DN, SLU_D, SLU_GE);
+  StatInit(&stat);
+  dgstrs(NOTRANS, &factor->L, &factor->U, factor->perm_c, factor->perm_r,
+         &dense, &stat, &info);
+  StatFree(&stat);
+  Destroy_SuperMatrix_Store(&dense);
+  if (info != 0)
+    fatal("HotSpot 7 fluid-block solve failed\n");
+}
+
+static double g7_solid_dot(g7_partition_context_t *context,
+                           const double *left, const double *right)
+{
+  double result = 0.0;
+  int index;
+  for (index = 0; index < context->fluid.full_count; index++)
+    if (context->fluid.full_to_fluid[index] < 0)
+      result += left[index] * right[index];
+  return result;
+}
+
+static int g7_solid_pcg_fixed(g7_partition_context_t *context,
+                              const double *rhs, double *state)
+{
+  int index, iteration;
+  double rho, next_rho;
+  int count = context->fluid.full_count;
+  double *residual = context->inner_residual;
+  double *preconditioned = context->inner_preconditioned;
+  double *direction = context->inner_direction;
+  double *product = context->inner_product;
+
+  if (context->exact_solid) {
+    int local;
+    zero_dvector(state, count);
+    for (local = 0; local < context->solid_factor.fluid_count; local++)
+      context->solid_rhs[local] =
+        rhs[context->solid_factor.fluid_to_full[local]];
+    g7_fluid_factor_solve(&context->solid_factor, context->solid_rhs,
+                          context->solid_solution);
+    for (local = 0; local < context->solid_factor.fluid_count; local++)
+      state[context->solid_factor.fluid_to_full[local]] =
+        context->solid_solution[local];
+    return 0;
+  }
+
+  zero_dvector(state, count);
+  for (index = 0; index < count; index++) {
+    if (context->fluid.full_to_fluid[index] < 0) {
+      residual[index] = rhs[index];
+      preconditioned[index] = residual[index] / context->diagonal[index];
+      direction[index] = preconditioned[index];
+    } else {
+      residual[index] = preconditioned[index] = direction[index] = 0.0;
+    }
+  }
+  rho = g7_solid_dot(context, residual, preconditioned);
+  if (rho == 0.0)
+    return 0;
+  if (!(rho > 0.0) || !isfinite(rho))
+    fatal("HotSpot 7 solid-block PCG found invalid initial energy\n");
+  for (iteration = 0; iteration < context->solid_pcg_steps; iteration++) {
+    double denominator, alpha, beta;
+    g7_operator_matvec(context->model, context->power, context->cap,
+                       context->rhs, direction, product, context->scaled);
+    denominator = g7_solid_dot(context, direction, product);
+    if (!(denominator > 0.0) || !isfinite(denominator))
+      fatal("HotSpot 7 solid-block PCG rejected a direction\n");
+    alpha = rho / denominator;
+    for (index = 0; index < count; index++) {
+      if (context->fluid.full_to_fluid[index] < 0) {
+        state[index] += alpha * direction[index];
+        residual[index] -= alpha * product[index];
+        preconditioned[index] =
+          residual[index] / context->diagonal[index];
+      }
+    }
+    next_rho = g7_solid_dot(context, residual, preconditioned);
+    if (next_rho == 0.0)
+      return iteration + 1;
+    if (!(next_rho > 0.0) || !isfinite(next_rho))
+      fatal("HotSpot 7 solid-block PCG found invalid residual energy\n");
+    beta = next_rho / rho;
+    for (index = 0; index < count; index++)
+      if (context->fluid.full_to_fluid[index] < 0)
+        direction[index] = preconditioned[index] + beta * direction[index];
+    rho = next_rho;
+  }
+  return context->solid_pcg_steps;
+}
+
+static int g7_partition_apply(g7_partition_context_t *context,
+                              const double *input, double *output)
+{
+  int index, local;
+  int inner_iterations = g7_solid_pcg_fixed(context, input, output);
+  g7_operator_matvec(context->model, context->power, context->cap,
+                     context->rhs, output, context->block_action,
+                     context->scaled);
+  for (local = 0; local < context->fluid.fluid_count; local++) {
+    index = context->fluid.fluid_to_full[local];
+    context->fluid_rhs[local] = input[index] - context->block_action[index];
+  }
+  g7_fluid_factor_solve(&context->fluid, context->fluid_rhs,
+                        context->fluid_rhs);
+  for (local = 0; local < context->fluid.fluid_count; local++)
+    output[context->fluid.fluid_to_full[local]] = context->fluid_rhs[local];
+  return inner_iterations;
+}
+
+static int g7_partitioned_fgmres_solve(
+    grid_model_t *model, grid_model_vector_t *power, const double *cap,
+    const double *rhs, const double *diagonal, double *state, double *scaled,
+    double tolerance, double *final_relative_residual,
+    SuperMatrix *assembled, int *solid_iterations)
+{
+  int count = g7_operator_node_count(model);
+  int restart = G7_GMRES_RESTART;
+  int total_iterations = 0;
+  int index, row, column, used;
+  const char *steps_text = getenv("HOTSPOT_G7_SOLID_PCG_STEPS");
+  const char *solid_solver_text = getenv("HOTSPOT_G7_SOLID_SOLVER");
+  double rhs_norm = g7_krylov_norm(rhs, count);
+  double residual_norm;
+  double *residual = (double *)calloc(count, sizeof(double));
+  double *work = (double *)calloc(count, sizeof(double));
+  double *basis = (double *)calloc((size_t)(restart + 1) * count,
+                                   sizeof(double));
+  double *preconditioned_basis = (double *)calloc(
+    (size_t)restart * count, sizeof(double));
+  double *hessenberg = (double *)calloc((size_t)(restart + 1) * restart,
+                                        sizeof(double));
+  double *cosines = (double *)calloc(restart, sizeof(double));
+  double *sines = (double *)calloc(restart, sizeof(double));
+  double *g = (double *)calloc(restart + 1, sizeof(double));
+  double *solution = (double *)calloc(restart, sizeof(double));
+  g7_partition_context_t context;
+  memset(&context, 0, sizeof(context));
+  context.model = model;
+  context.power = power;
+  context.cap = cap;
+  context.rhs = rhs;
+  context.diagonal = diagonal;
+  context.scaled = scaled;
+  context.solid_pcg_steps = steps_text && steps_text[0] ? atoi(steps_text) : 4;
+  context.exact_solid = solid_solver_text &&
+    !strcmp(solid_solver_text, "exact");
+  if (solid_solver_text && solid_solver_text[0] &&
+      strcmp(solid_solver_text, "pcg") &&
+      strcmp(solid_solver_text, "exact"))
+    fatal("HOTSPOT_G7_SOLID_SOLVER must be pcg or exact\n");
+  if (context.solid_pcg_steps <= 0 || context.solid_pcg_steps > 1000)
+    fatal("invalid HOTSPOT_G7_SOLID_PCG_STEPS\n");
+  if (!assembled)
+    fatal("HotSpot 7 partitioned solver requires its cooling block\n");
+  g7_fluid_factor_build(&context.fluid, model, assembled, diagonal, 1);
+  if (context.exact_solid)
+    g7_fluid_factor_build(&context.solid_factor, model, assembled,
+                          diagonal, 0);
+  context.inner_residual = (double *)calloc(count, sizeof(double));
+  context.inner_preconditioned = (double *)calloc(count, sizeof(double));
+  context.inner_direction = (double *)calloc(count, sizeof(double));
+  context.inner_product = (double *)calloc(count, sizeof(double));
+  context.block_action = (double *)calloc(count, sizeof(double));
+  context.fluid_rhs = (double *)calloc(context.fluid.fluid_count,
+                                       sizeof(double));
+  if (context.exact_solid) {
+    context.solid_rhs = (double *)calloc(
+      context.solid_factor.fluid_count, sizeof(double));
+    context.solid_solution = (double *)calloc(
+      context.solid_factor.fluid_count, sizeof(double));
+  }
+  if (!residual || !work || !basis || !preconditioned_basis ||
+      !hessenberg || !cosines || !sines || !g || !solution ||
+      !context.inner_residual || !context.inner_preconditioned ||
+      !context.inner_direction || !context.inner_product ||
+      !context.block_action || !context.fluid_rhs ||
+      (context.exact_solid &&
+       (!context.solid_rhs || !context.solid_solution)))
+    fatal("HotSpot 7 partitioned FGMRES allocation failed\n");
+  if (!(rhs_norm > 0.0) || !isfinite(rhs_norm))
+    fatal("HotSpot 7 partitioned FGMRES found invalid right-hand side\n");
+
+  *solid_iterations = 0;
+  while (total_iterations < G7_KRYLOV_MAX_ITERATIONS) {
+    double beta;
+    g7_operator_residual(model, power, cap, state, residual);
+    residual_norm = g7_krylov_norm(residual, count);
+    if (residual_norm <= tolerance * rhs_norm)
+      break;
+    beta = residual_norm;
+    memset(hessenberg, 0,
+           (size_t)(restart + 1) * restart * sizeof(double));
+    memset(cosines, 0, (size_t)restart * sizeof(double));
+    memset(sines, 0, (size_t)restart * sizeof(double));
+    memset(g, 0, (size_t)(restart + 1) * sizeof(double));
+    g[0] = beta;
+    for (index = 0; index < count; index++)
+      basis[index] = residual[index] / beta;
+
+    used = 0;
+    for (column = 0; column < restart &&
+         total_iterations < G7_KRYLOV_MAX_ITERATIONS; column++) {
+      double next_norm, rotation_norm;
+      double *current = &basis[(size_t)column * count];
+      double *preconditioned =
+        &preconditioned_basis[(size_t)column * count];
+      double *next = &basis[(size_t)(column + 1) * count];
+      *solid_iterations += g7_partition_apply(
+        &context, current, preconditioned);
+      g7_operator_matvec(model, power, cap, rhs, preconditioned, work,
+                         scaled);
+      for (row = 0; row <= column; row++) {
+        double *previous = &basis[(size_t)row * count];
+        double value = g7_krylov_dot(work, previous, count);
+        hessenberg[(size_t)row * restart + column] = value;
+        for (index = 0; index < count; index++)
+          work[index] -= value * previous[index];
+      }
+      next_norm = g7_krylov_norm(work, count);
+      hessenberg[(size_t)(column + 1) * restart + column] = next_norm;
+      if (next_norm > 0.0 && isfinite(next_norm))
+        for (index = 0; index < count; index++)
+          next[index] = work[index] / next_norm;
+      for (row = 0; row < column; row++) {
+        double upper = hessenberg[(size_t)row * restart + column];
+        double lower = hessenberg[(size_t)(row + 1) * restart + column];
+        hessenberg[(size_t)row * restart + column] =
+          cosines[row] * upper + sines[row] * lower;
+        hessenberg[(size_t)(row + 1) * restart + column] =
+          -sines[row] * upper + cosines[row] * lower;
+      }
+      rotation_norm = hypot(
+        hessenberg[(size_t)column * restart + column],
+        hessenberg[(size_t)(column + 1) * restart + column]);
+      if (!(rotation_norm > 0.0) || !isfinite(rotation_norm))
+        fatal("HotSpot 7 partitioned FGMRES found singular Hessenberg data\n");
+      cosines[column] =
+        hessenberg[(size_t)column * restart + column] / rotation_norm;
+      sines[column] =
+        hessenberg[(size_t)(column + 1) * restart + column] / rotation_norm;
+      hessenberg[(size_t)column * restart + column] = rotation_norm;
+      hessenberg[(size_t)(column + 1) * restart + column] = 0.0;
+      {
+        double upper = g[column];
+        double lower = g[column + 1];
+        g[column] = cosines[column] * upper + sines[column] * lower;
+        g[column + 1] = -sines[column] * upper + cosines[column] * lower;
+      }
+      used = column + 1;
+      total_iterations++;
+      if (next_norm == 0.0 || fabs(g[column + 1]) <= tolerance * rhs_norm)
+        break;
+    }
+    for (row = used - 1; row >= 0; row--) {
+      double value = g[row];
+      for (column = row + 1; column < used; column++)
+        value -= hessenberg[(size_t)row * restart + column] *
+          solution[column];
+      solution[row] = value /
+        hessenberg[(size_t)row * restart + row];
+    }
+    for (row = 0; row < used; row++) {
+      double *vector = &preconditioned_basis[(size_t)row * count];
+      for (index = 0; index < count; index++)
+        state[index] += solution[row] * vector[index];
+    }
+  }
+  g7_operator_residual(model, power, cap, state, residual);
+  residual_norm = g7_krylov_norm(residual, count);
+  *final_relative_residual = residual_norm / rhs_norm;
+  fprintf(stdout,
+          "HotSpot 7 partitioned preconditioner: cooling_nodes=%d "
+          "solid_solver=%s solid_pcg_steps=%d solid_iterations=%d "
+          "schur_response_sum=%.9e schur_response_max=%.9e\n",
+          context.fluid.fluid_count,
+          context.exact_solid ? "exact" : "pcg",
+          context.solid_pcg_steps,
+          *solid_iterations, context.fluid.response_diagonal_sum,
+          context.fluid.response_diagonal_max);
+  g7_fluid_factor_free(&context.fluid);
+  if (context.exact_solid)
+    g7_fluid_factor_free(&context.solid_factor);
+  free(context.inner_residual); free(context.inner_preconditioned);
+  free(context.inner_direction); free(context.inner_product);
+  free(context.block_action); free(context.fluid_rhs);
+  free(context.solid_rhs); free(context.solid_solution);
+  free(residual); free(work); free(basis); free(preconditioned_basis);
+  free(hessenberg); free(cosines); free(sines); free(g); free(solution);
+  return total_iterations;
+}
+
+static void g7_krylov_solve(grid_model_t *model, grid_model_vector_t *power,
+                            grid_model_vector_t *temp, const double *rhs,
+                            const char *requested_solver,
+                            SuperMatrix *assembled)
+{
+  int count = g7_operator_node_count(model);
+  int iterations;
+  double tolerance = g7_krylov_tolerance();
+  double relative_residual = INFINITY;
+  double maximum_flow = g7_operator_max_flow(model);
+  int admitted_spd = maximum_flow <= 1.0e-30;
+  int solid_iterations = 0;
+  const char *solver = requested_solver;
+  double *cap = (double *)calloc(count, sizeof(double));
+  double *diagonal = (double *)calloc(count, sizeof(double));
+  double *basis = (double *)calloc(count, sizeof(double));
+  double *work = (double *)calloc(count, sizeof(double));
+  double *scaled = (double *)calloc(count, sizeof(double));
+  double *state = temp->cuboid[0][0];
+  if (!cap || !diagonal || !basis || !work || !scaled)
+    fatal("HotSpot 7 Krylov allocation failed\n");
+  if (!solver || !solver[0] || !strcmp(solver, "auto"))
+    solver = admitted_spd ? "pcg" : "gmres";
+  if (strcmp(solver, "pcg") && strcmp(solver, "gmres") &&
+      strcmp(solver, "partitioned"))
+    fatal("HOTSPOT_G7_SOLVER must be auto, pcg, gmres, partitioned, or superlu\n");
+  if (!strcmp(solver, "pcg") && !admitted_spd)
+    fatal("HotSpot 7 operator admission rejected PCG for nonzero flow\n");
+  if (!model->c_ready)
+    populate_C_model_grid(model, NULL);
+  g7_operator_build_capacitance(model, cap);
+  g7_operator_build_diagonal(model, power, cap, rhs, diagonal,
+                             basis, work, scaled);
+  if (!getenv("HOTSPOT_G7_WARM_START"))
+    set_heuristic_temp(model, power, temp);
+  if (!strcmp(solver, "pcg"))
+    iterations = g7_pcg_solve(model, power, cap, rhs, diagonal, state,
+                              scaled, tolerance, &relative_residual);
+  else if (!strcmp(solver, "gmres"))
+    iterations = g7_gmres_solve(model, power, cap, rhs, diagonal, state,
+                                scaled, tolerance, &relative_residual);
+  else
+    iterations = g7_partitioned_fgmres_solve(
+      model, power, cap, rhs, diagonal, state, scaled, tolerance,
+      &relative_residual, assembled, &solid_iterations);
+  fprintf(stdout,
+          "HotSpot 7 Krylov termination: solver=%s admitted_spd=%d "
+          "max_flow=%.9e iterations=%d relative_residual=%.9e\n",
+          solver, admitted_spd, maximum_flow, iterations, relative_residual);
+  if (!(relative_residual <= tolerance) || !isfinite(relative_residual))
+    fatal("HotSpot 7 Krylov reached its iteration limit\n");
+  g7_write_state_if_requested(model);
+  free(cap); free(diagonal); free(basis); free(work); free(scaled);
+}
+
+#endif
+
 double find_res(grid_model_t *model, int n1, int i1, int j1, int n2, int i2, int j2) {
   double res;
 
@@ -5131,6 +6383,14 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
 {
   SuperMatrix A, L, U, B;
   double   *P;
+  const char *requested_solver = getenv("HOTSPOT_G7_SOLVER");
+  const char *audit_prefix = getenv("HOTSPOT_G7_OPERATOR_PREFIX");
+  int auto_solver = !requested_solver || !requested_solver[0] ||
+    !strcmp(requested_solver, "auto");
+  int use_superlu = requested_solver && !strcmp(requested_solver, "superlu");
+  int use_partitioned = requested_solver &&
+    !strcmp(requested_solver, "partitioned");
+  int have_matrix = 0;
   int      *perm_r; /* row permutations from partial pivoting */
   int      *perm_c; /* column permutation vector */
   int      info;
@@ -5151,13 +6411,32 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   else
     dim = nl*nr*nc + EXTRA;
 
-  //A = build_steady_grid_matrix(model);
-  //B = build_steady_rhs_vector(model, power, &power_vector);
-  A = build_transient_grid_matrix(model);
   P = build_transient_power_vector(model, power);
+  if (auto_solver && g7_operator_max_flow(model) > 1.0e-30) {
+    use_superlu = 1;
+    fprintf(stdout,
+            "HotSpot 7 solver admission: nonsymmetric flowing operator; "
+            "using SuperLU fallback\n");
+  }
+  if (use_superlu || use_partitioned || (audit_prefix && audit_prefix[0])) {
+    A = build_transient_grid_matrix(model);
+    have_matrix = 1;
+  }
+  if (audit_prefix && audit_prefix[0])
+    g7_operator_audit(model, power, &A, P);
 
   if(MAKE_CSVS) {
     vectorTocsv("P.csv", nl*nr*nc + EXTRA, P);
+  }
+
+  if (!use_superlu) {
+    g7_krylov_solve(model, power, temp, P,
+                    requested_solver ? requested_solver : "auto",
+                    have_matrix ? &A : NULL);
+    if (have_matrix)
+      Destroy_CompCol_Matrix(&A);
+    SUPERLU_FREE(P);
+    return;
   }
 
   dCreate_Dense_Matrix(&B, dim, 1, P, dim, SLU_DN, SLU_D, SLU_GE);
@@ -5182,6 +6461,7 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   for(i=0; i<dim; ++i){
       model->last_steady->cuboid[0][0][i] = dp[i];
   }
+  g7_write_state_if_requested(model);
 
   //SUPERLU_FREE (power_vector);
   SUPERLU_FREE (perm_r);

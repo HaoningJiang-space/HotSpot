@@ -17,6 +17,7 @@
 
 // One extra node for the pump
 #define EXTRA_PRESSURE_NODES 1
+#define MAX_COOLING_BRANCHES 4
 
 #define IS_FLUID_CELL(uconf, i, j)  (uconf->cell_types[i][j] == FLUID || \
                                      uconf->cell_types[i][j] == INLET || \
@@ -40,8 +41,23 @@ typedef struct microchannel_config_t_st
   // pumping pressure between inlet(s) and outlet(s) in Pa
   double pumping_pressure;
 
-  // pump internal resistance in K/W
+  // legacy inlet-to-fixed-pressure hydraulic resistance in Pa-s/m^3
   double pump_internal_res;
+
+  // Number of independently throttled branches sharing one pump.
+  int cooling_branch_count;
+
+  // Series hydraulic resistance of each branch valve in Pa-s/m^3.
+  double valve_resistance[MAX_COOLING_BRANCHES];
+
+  // Distribution resistance from a branch manifold to each channel inlet.
+  double manifold_inlet_resistance;
+
+  // Linear shared-pump curve: delta_p = pumping_pressure - R_pump * Q.
+  double pump_curve_resistance;
+
+  // Hydraulic-to-electrical efficiency used for pump-power accounting.
+  double pump_efficiency;
 
   // temperature of coolant at inlet in K
   double inlet_temperature;
@@ -80,6 +96,9 @@ typedef struct microchannel_config_t_st
   // array of cell types
   int **cell_types;
 
+  // Optional branch identifier carried by network tokens such as "2:0".
+  int **branch_ids;
+
   // mapping from cell indices to pressure circuit node indices
   int **mapping;
 
@@ -87,6 +106,14 @@ typedef struct microchannel_config_t_st
   double **A;
   double *b;
   int nnz;
+
+  // Last solved hydraulic operating point.
+  double branch_flow[MAX_COOLING_BRANCHES];
+  double total_flow;
+  double solved_pump_pressure;
+  double pump_power;
+  double hydraulic_conservation_error;
+  double pump_curve_residual;
 } microchannel_config_t;
 
 microchannel_config_t default_microchannel_config(void);

@@ -138,8 +138,14 @@ typedef struct microchannel_config_t_st
   // pumping pressure between inlet(s) and outlet(s) in Pa
   double pumping_pressure;
 
-  // pump internal resistance in K/W
+  // legacy inlet-to-fixed-pressure hydraulic resistance in Pa-s/m^3
   double pump_internal_res;
+
+  int cooling_branch_count;
+  double valve_resistance[4];
+  double manifold_inlet_resistance;
+  double pump_curve_resistance;
+  double pump_efficiency;
 
   // temperature of coolant at inlet in K
   double inlet_temperature;
@@ -178,6 +184,8 @@ typedef struct microchannel_config_t_st
   // array of cell types
   int **cell_types;
 
+  int **branch_ids;
+
   // mapping from cell indices to pressure circuit node indices
   int **mapping;
 
@@ -185,6 +193,13 @@ typedef struct microchannel_config_t_st
   double **A;
   double *b;
   int nnz;
+
+  double branch_flow[4];
+  double total_flow;
+  double solved_pump_pressure;
+  double pump_power;
+  double hydraulic_conservation_error;
+  double pump_curve_residual;
 } microchannel_config_t;
 
 // Individual material properties

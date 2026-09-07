@@ -10,19 +10,40 @@
 #define MAX_LINE_SIZE 4096
 #define DEBUG 0
 
-// How many extra nodes we need to include in the pressure circuit
-int extra_pressure_nodes;
+static int uses_shared_pump(const microchannel_config_t *config)
+{
+  return config->cooling_branch_count > 0;
+}
+
+static int pressure_node_count(const microchannel_config_t *config)
+{
+  if(uses_shared_pump(config))
+    return config->n_fluid_cells + config->cooling_branch_count + 1;
+  return config->n_fluid_cells +
+    (config->pump_internal_res != 0.0 ? EXTRA_PRESSURE_NODES : 0);
+}
+
+static void record_hydraulic_operating_point(microchannel_config_t *config);
 
 // default microchannel configuration parameters
 microchannel_config_t default_microchannel_config(void)
 {
   microchannel_config_t config;
+  int branch;
 
   config.cell_width        = 100e-6;
   config.cell_height       = 100e-6;
   config.cell_thickness    = 100e-6;
   config.pumping_pressure  = 5000;
   config.pump_internal_res = 0;            // ideal pump
+  config.cooling_branch_count = 0;
+  for(branch = 0; branch < MAX_COOLING_BRANCHES; branch++) {
+    config.valve_resistance[branch] = 0.0;
+    config.branch_flow[branch] = 0.0;
+  }
+  config.pump_curve_resistance = 0.0;
+  config.manifold_inlet_resistance = 0.0;
+  config.pump_efficiency       = 1.0;
   config.inlet_temperature = 300;
   config.coolant_capac     = 4172638;      // water
   config.coolant_res       = 1.647717911;  // water
@@ -34,10 +55,16 @@ microchannel_config_t default_microchannel_config(void)
   config.num_columns       = -1;
   config.n_fluid_cells     = -1;
   config.cell_types        = NULL;
+  config.branch_ids        = NULL;
   config.mapping           = NULL;
   config.A                 = NULL;
   config.b                 = NULL;
   config.nnz               = 0;
+  config.total_flow        = 0.0;
+  config.solved_pump_pressure = 0.0;
+  config.pump_power        = 0.0;
+  config.hydraulic_conservation_error = 0.0;
+  config.pump_curve_residual = 0.0;
 
   return config;
 }
@@ -48,7 +75,8 @@ microchannel_config_t default_microchannel_config(void)
  */
 void microchannel_config_add_from_strs(microchannel_config_t *config, materials_list_t *materials_list, str_pair *table, int size)
 {
-  int idx;
+  int idx, branch;
+  char option[STR_SIZE];
 
   if ((idx = get_str_index(table, size, "pumping_pressure")) >= 0)
     if(sscanf(table[idx].value, "%lf", &config->pumping_pressure) != 1)
@@ -56,6 +84,24 @@ void microchannel_config_add_from_strs(microchannel_config_t *config, materials_
   if ((idx = get_str_index(table, size, "pump_internal_res")) >= 0)
     if(sscanf(table[idx].value, "%lf", &config->pump_internal_res) != 1)
       fatal("invalid format for configuration  parameter pumping internal resistance\n");
+  if ((idx = get_str_index(table, size, "cooling_branch_count")) >= 0)
+    if(sscanf(table[idx].value, "%d", &config->cooling_branch_count) != 1)
+      fatal("invalid format for configuration parameter cooling_branch_count\n");
+  for(branch = 0; branch < MAX_COOLING_BRANCHES; branch++) {
+    sprintf(option, "valve_resistance_%d", branch);
+    if ((idx = get_str_index(table, size, option)) >= 0)
+      if(sscanf(table[idx].value, "%lf", &config->valve_resistance[branch]) != 1)
+        fatal("invalid format for branch valve resistance\n");
+  }
+  if ((idx = get_str_index(table, size, "pump_curve_resistance")) >= 0)
+    if(sscanf(table[idx].value, "%lf", &config->pump_curve_resistance) != 1)
+      fatal("invalid format for configuration parameter pump_curve_resistance\n");
+  if ((idx = get_str_index(table, size, "manifold_inlet_resistance")) >= 0)
+    if(sscanf(table[idx].value, "%lf", &config->manifold_inlet_resistance) != 1)
+      fatal("invalid format for configuration parameter manifold_inlet_resistance\n");
+  if ((idx = get_str_index(table, size, "pump_efficiency")) >= 0)
+    if(sscanf(table[idx].value, "%lf", &config->pump_efficiency) != 1)
+      fatal("invalid format for configuration parameter pump_efficiency\n");
   if ((idx = get_str_index(table, size, "inlet_temperature")) >= 0)
     if(sscanf(table[idx].value, "%lf", &config->inlet_temperature) != 1)
       fatal("invalid format for configuration  parameter inlet_temperature\n");
@@ -105,6 +151,21 @@ void microchannel_config_add_from_strs(microchannel_config_t *config, materials_
     if(config->coolant_res < 0 || config->coolant_capac < 0 || config->coolant_visc < 0)
       fatal("material name specified in configuration parameter coolant_material not found\n");
   }
+
+  if(config->cooling_branch_count < 0 ||
+     config->cooling_branch_count > MAX_COOLING_BRANCHES)
+    fatal("cooling_branch_count must be between zero and four\n");
+  if(config->pump_curve_resistance < 0.0)
+    fatal("pump_curve_resistance must be nonnegative\n");
+  if(config->pump_efficiency <= 0.0 || config->pump_efficiency > 1.0)
+    fatal("pump_efficiency must be in (0, 1]\n");
+  for(branch = 0; branch < config->cooling_branch_count; branch++)
+    if(config->valve_resistance[branch] <= 0.0)
+      fatal("active branch valve resistance must be positive\n");
+  if(uses_shared_pump(config) && config->manifold_inlet_resistance <= 0.0)
+    fatal("shared-pump manifold inlet resistance must be positive\n");
+  if(uses_shared_pump(config) && config->pump_internal_res != 0.0)
+    fatal("shared-pump controls cannot be combined with legacy pump_internal_res\n");
 }
 
 /*
@@ -113,7 +174,7 @@ void microchannel_config_add_from_strs(microchannel_config_t *config, materials_
  */
 int microchannel_config_to_strs(microchannel_config_t *config, str_pair *table, int max_entries)
 {
-  if (max_entries < 17)
+  if (max_entries < 25)
     fatal("not enough entries in table\n");
 
   sprintf(table[0].name, "cell_width");
@@ -133,6 +194,14 @@ int microchannel_config_to_strs(microchannel_config_t *config, str_pair *table, 
   sprintf(table[14].name, "num_rows");
   sprintf(table[15].name, "num_columns");
   sprintf(table[16].name, "n_fluid_cells");
+  sprintf(table[17].name, "cooling_branch_count");
+  sprintf(table[18].name, "valve_resistance_0");
+  sprintf(table[19].name, "valve_resistance_1");
+  sprintf(table[20].name, "valve_resistance_2");
+  sprintf(table[21].name, "valve_resistance_3");
+  sprintf(table[22].name, "pump_curve_resistance");
+  sprintf(table[23].name, "pump_efficiency");
+  sprintf(table[24].name, "manifold_inlet_resistance");
 
   sprintf(table[0].value, "%e", config->cell_width);
   sprintf(table[1].value, "%e", config->cell_height);
@@ -151,8 +220,16 @@ int microchannel_config_to_strs(microchannel_config_t *config, str_pair *table, 
   sprintf(table[14].value, "%d", config->num_rows);
   sprintf(table[15].value, "%d", config->num_columns);
   sprintf(table[16].value, "%d", config->n_fluid_cells);
+  sprintf(table[17].value, "%d", config->cooling_branch_count);
+  sprintf(table[18].value, "%e", config->valve_resistance[0]);
+  sprintf(table[19].value, "%e", config->valve_resistance[1]);
+  sprintf(table[20].value, "%e", config->valve_resistance[2]);
+  sprintf(table[21].value, "%e", config->valve_resistance[3]);
+  sprintf(table[22].value, "%e", config->pump_curve_resistance);
+  sprintf(table[23].value, "%e", config->pump_efficiency);
+  sprintf(table[24].value, "%e", config->manifold_inlet_resistance);
 
-  return 16;
+  return 25;
 }
 
 void solve_pressure_circuit(microchannel_config_t *config) {
@@ -167,7 +244,8 @@ void solve_pressure_circuit(microchannel_config_t *config) {
   superlu_options_t options;
   SuperLUStat_t stat;
 
-  m = n = config->n_fluid_cells + extra_pressure_nodes;
+  int node_count = pressure_node_count(config);
+  m = n = node_count;
   nnz = config->nnz;
   if( !(a = doubleMalloc(nnz)) ) ABORT("malloc failed");
   if( !(asub = intMalloc(nnz)) ) ABORT("malloc failed");
@@ -185,6 +263,8 @@ void solve_pressure_circuit(microchannel_config_t *config) {
     }
     xa[x++] = v;
   }
+  if(v != nnz)
+    fatal("Pressure-network nonzero count does not match assembled matrix\n");
 
   if(DEBUG) {
     fprintf(stderr, "\n");
@@ -218,6 +298,8 @@ void solve_pressure_circuit(microchannel_config_t *config) {
   StatInit(&stat);
 
   dgssv(&options, &A, perm_c, perm_r, &L, &U, &B, &stat, &info);
+  if(info != 0)
+    fatal("Unable to solve microchannel pressure network\n");
 
   if(DEBUG) {
     //dPrint_CompCol_Matrix("A", &A);
@@ -227,11 +309,13 @@ void solve_pressure_circuit(microchannel_config_t *config) {
   DNformat *Astore = (DNformat *) B.Store;
   double *dp = (double *) Astore->nzval;
 
-    for(i = 0; i < n; i++) {
+  for(i = 0; i < n; i++) {
       config->b[i] = dp[i];
       if(DEBUG)
         fprintf(stderr, "config->b[%d] = %e\n", i, config->b[i]);
     }
+
+  record_hydraulic_operating_point(config);
 
   SUPERLU_FREE(rhs);
   SUPERLU_FREE(perm_r);
@@ -243,11 +327,13 @@ void solve_pressure_circuit(microchannel_config_t *config) {
   StatFree(&stat);
 #else
 
-  gaussj(config->A, config->n_fluid_cells + extra_pressure_nodes, config->b);
+  int node_count = pressure_node_count(config);
+  gaussj(config->A, node_count, config->b);
+  record_hydraulic_operating_point(config);
 
   if(DEBUG) {
     int i;
-    for(i = 0; i < config->n_fluid_cells + extra_pressure_nodes; i++)
+    for(i = 0; i < node_count; i++)
       fprintf(stderr, "config->b[%d] = %e\n", i, config->b[i]);
   }
 
@@ -258,7 +344,7 @@ void solve_pressure_circuit(microchannel_config_t *config) {
 void microchannel_build_network(microchannel_config_t *config) {
   char line[MAX_LINE_SIZE], str[STR_SIZE];
   char *cell;
-  int cell_type, i = 0, j = 0;
+  int cell_type, branch_id, i = 0, j = 0;
   FILE *fp = fopen(config->network_file, "r");
 
   if(DEBUG)
@@ -278,53 +364,77 @@ void microchannel_build_network(microchannel_config_t *config) {
     fprintf(stderr, "num_rows: %d, num_cols: %d\n", nr, nc);
 
   config->cell_types = calloc(nr, sizeof(int *));
+  config->branch_ids = calloc(nr, sizeof(int *));
 
-  if (config->cell_types == NULL) {
-    fprintf(stderr, "ERROR: Couldn't allocate space for cell_types array");
-  }
+  if (config->cell_types == NULL || config->branch_ids == NULL)
+    fatal("Unable to allocate microchannel cell metadata\n");
 
   for(i = 0; i < nr; i++) {
     config->cell_types[i] = calloc(nc, sizeof(int));
+    config->branch_ids[i] = malloc(nc * sizeof(int));
 
-    if (config->cell_types[i] == NULL) {
-      fprintf(stderr, "ERROR: Couldn't allocate space for cell_types[%d] array", i);
-    }
+    if (config->cell_types[i] == NULL || config->branch_ids[i] == NULL)
+      fatal("Unable to allocate microchannel row metadata\n");
+    for(j = 0; j < nc; j++)
+      config->branch_ids[i][j] = -1;
   }
 
   // parse network file to build cell_types array
   i = j = 0;
   fgets(line, MAX_LINE_SIZE, fp);
   while(!feof(fp)) {
+    if(i >= nr) {
+      fclose(fp);
+      sprintf(str, "Microchannel has more rows than num_rows(%d)\n", nr);
+      fatal(str);
+    }
     cell = strtok(line, " ,\n");
     while(cell != NULL) {
-      cell_type = atoi(cell);
+      if(j >= nc) {
+        fclose(fp);
+        sprintf(str, "Microchannel row %d has more cells than num_columns(%d)\n", i, nc);
+        fatal(str);
+      }
+      branch_id = -1;
+      if(sscanf(cell, "%d:%d", &cell_type, &branch_id) < 1) {
+        fclose(fp);
+        fatal("Invalid microchannel cell token\n");
+      }
+      if(branch_id < -1 || branch_id >= config->cooling_branch_count) {
+        fclose(fp);
+        fatal("Microchannel branch identifier is outside cooling_branch_count\n");
+      }
       config->cell_types[i][j] = cell_type;
+      config->branch_ids[i][j] = branch_id;
       if(DEBUG)
         fprintf(stderr, "Adding cell %d, %d; type = %d\n", i, j, config->cell_types[i][j]);
       j++;
 
 
-      if(j > nc) {
-        fclose(fp);
-        sprintf(str, "Microchannel row %d has more cells than num_columns(%d)\n", i, nc);
-        fatal(str);
-      }
-
       cell = strtok(NULL, " ,\n");
     }
 
-    i++; j = 0;
-
-    if(i > nr) {
+    if(j != nc) {
       fclose(fp);
-      sprintf(str, "Microchannel has more rows than num_rows(%d)\n", nr);
+      sprintf(str, "Microchannel row %d has %d cells, expected %d\n", i, j, nc);
       fatal(str);
     }
+
+    i++; j = 0;
 
     fgets(line, MAX_LINE_SIZE, fp);
   }
 
   fclose(fp);
+  if(i != nr)
+    fatal("Microchannel has fewer rows than num_rows\n");
+
+  if(uses_shared_pump(config)) {
+    for(i = 0; i < nr; i++)
+      for(j = 0; j < nc; j++)
+        if(IS_INLET_CELL(config, i, j) && config->branch_ids[i][j] < 0)
+          fatal("Every inlet requires a branch identifier in shared-pump mode\n");
+  }
 
   // Create floorplan file for microchannel
   strcpy(config->floorplan_file, config->network_file);
@@ -338,12 +448,12 @@ void microchannel_build_network(microchannel_config_t *config) {
       if(IS_FLUID_CELL(config, i, j)) {
         // For floorplan files, x = y = 0 is the bottom left corner, but for our parsing i = j = 0 is
         // the top left cell, so we have to account for that
-        fprintf(fp, "Cell_%d_%d\t%e\t%e\t%e\t%e\t%e\t%e\n", i, j, config->cell_width, config->cell_height,
+        fprintf(fp, "Cell_%d_%d\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n", i, j, config->cell_width, config->cell_height,
                 j*config->cell_width, (config->num_rows - i - 1)*config->cell_height, config->coolant_capac,
                 config->coolant_res);
       }
       else {
-        fprintf(fp, "Cell_%d_%d\t%e\t%e\t%e\t%e\t%e\t%e\n", i, j, config->cell_width, config->cell_height,
+        fprintf(fp, "Cell_%d_%d\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n", i, j, config->cell_width, config->cell_height,
                 j*config->cell_width, (config->num_rows - i - 1)*config->cell_height, config->wall_capac,
                 config->wall_res);
       }
@@ -376,7 +486,7 @@ double hydroC(microchannel_config_t *config) {
 }
 
 void build_pressure_matrix(microchannel_config_t *config) {
-  int i, j;
+  int i, j, branch;
   int nr = config->num_rows;
   int nc = config->num_columns;
   int **mapping;
@@ -409,26 +519,27 @@ void build_pressure_matrix(microchannel_config_t *config) {
   config->n_fluid_cells = n;
   config->mapping = mapping;
 
-  // If we're modeling a non-ideal pump, we include one extra node for the pump
-  if(config->pump_internal_res == 0) {
-    extra_pressure_nodes = 0;
-  }
-  else {
-    extra_pressure_nodes = 1;
-  }
+  // If we're modeling a non-ideal pump, include one extra pressure node.
+  // Keep the dimension local to this config: multiple microchannel layers may
+  // legitimately use different pump models.
+  int node_count = pressure_node_count(config);
+  int shared_pump = uses_shared_pump(config);
+  int branch_node_base = config->n_fluid_cells;
+  int pump_node = config->n_fluid_cells + config->cooling_branch_count;
+  int branch_inlets[MAX_COOLING_BRANCHES] = {0, 0, 0, 0};
 
-  config->A = calloc(config->n_fluid_cells + extra_pressure_nodes, sizeof(double *));
+  config->A = calloc(node_count, sizeof(double *));
 
   if(!config->A)
     fatal("Unable to allocate matrix A for pressure circuit\n");
-  for(i = 0; i < config->n_fluid_cells + extra_pressure_nodes; i++) {
-    config->A[i] = calloc(config->n_fluid_cells, sizeof(double));
+  for(i = 0; i < node_count; i++) {
+    config->A[i] = calloc(node_count, sizeof(double));
 
     if(!config->A[i])
       fatal("Unable to allocate matrix A for pressure circuit\n");
   }
 
-  config->b = calloc(config->n_fluid_cells + extra_pressure_nodes, sizeof(double));
+  config->b = calloc(node_count, sizeof(double));
 
   if(!config->b)
     fatal("Unable to allocate matrix b for pressure circuit\n");
@@ -449,7 +560,8 @@ void build_pressure_matrix(microchannel_config_t *config) {
   for(i = 0; i < nr; i++) {
     for(j = 0; j < nc; j++) {
       if(config->cell_types[i][j] == FLUID ||
-         (config->cell_types[i][j] == INLET && config->pump_internal_res != 0)) {
+         (config->cell_types[i][j] == INLET &&
+          (shared_pump || config->pump_internal_res != 0))) {
         // northern cell
           if(i > 0 && IS_FLUID_CELL(config, i-1, j)) {
             if(DEBUG)
@@ -500,8 +612,21 @@ void build_pressure_matrix(microchannel_config_t *config) {
       }
 
       if(IS_INLET_CELL(config, i, j)) {
+        if(shared_pump) {
+          double manifold_conductance =
+            1.0 / config->manifold_inlet_resistance;
+          int branch_node;
+          branch = config->branch_ids[i][j];
+          branch_node = branch_node_base + branch;
+          config->A[mapping[i][j]][branch_node] = -manifold_conductance;
+          config->A[mapping[i][j]][mapping[i][j]] += manifold_conductance;
+          config->A[branch_node][mapping[i][j]] = -manifold_conductance;
+          config->A[branch_node][branch_node] += manifold_conductance;
+          branch_inlets[branch]++;
+          config->nnz += 2;
+        }
         // Non-ideal pump
-        if(config->pump_internal_res != 0) {
+        else if(config->pump_internal_res != 0) {
           if(DEBUG) {
             fprintf(stderr, "[%d, %d]: Inlet. Setting A[%d][%d] = %e\n", i, j, mapping[i][j], config->n_fluid_cells, -1.0 / config->pump_internal_res);
             fprintf(stderr, "[%d, %d]: Inlet. Setting A[%d][%d] = %e\n", i, j, mapping[i][j], mapping[i][j], 1.0 / config->pump_internal_res);
@@ -536,7 +661,39 @@ void build_pressure_matrix(microchannel_config_t *config) {
     }
   }
 
-  if(config->pump_internal_res != 0) {
+  if(shared_pump) {
+    double pump_conductance_sum = 0.0;
+    for(branch = 0; branch < config->cooling_branch_count; branch++) {
+      int branch_node = branch_node_base + branch;
+      double valve_conductance = 1.0 / config->valve_resistance[branch];
+      if(branch_inlets[branch] == 0)
+        fatal("Every active cooling branch requires at least one inlet\n");
+      config->A[branch_node][branch_node] += valve_conductance;
+      config->A[branch_node][pump_node] = -valve_conductance;
+      pump_conductance_sum += valve_conductance;
+      config->nnz += 2;
+    }
+    if(config->pump_curve_resistance > 0.0) {
+      double pump_ground_conductance =
+        1.0 / config->pump_curve_resistance;
+      config->A[pump_node][pump_node] =
+        pump_conductance_sum + pump_ground_conductance;
+      config->b[pump_node] =
+        pump_ground_conductance * config->pumping_pressure;
+      config->nnz++;
+      for(branch = 0; branch < config->cooling_branch_count; branch++) {
+        config->A[pump_node][branch_node_base + branch] =
+          -1.0 / config->valve_resistance[branch];
+        config->nnz++;
+      }
+    }
+    else {
+      config->A[pump_node][pump_node] = 1.0;
+      config->b[pump_node] = config->pumping_pressure;
+      config->nnz++;
+    }
+  }
+  else if(config->pump_internal_res != 0) {
     if(DEBUG) {
       fprintf(stderr, "Pump Node. Setting A[%d][%d] = %e\n", config->n_fluid_cells, config->n_fluid_cells, 1.0);
       fprintf(stderr, "Pump Node. Setting b[%d] = %e\n", config->n_fluid_cells, config->pumping_pressure);
@@ -550,15 +707,15 @@ void build_pressure_matrix(microchannel_config_t *config) {
 
   if(DEBUG) {
     fprintf(stderr, "Nonzero values (%d total):\n", config->nnz);
-     for(i = 0; i < config->n_fluid_cells + extra_pressure_nodes; i++) {
-      for(j = 0; j < config->n_fluid_cells + extra_pressure_nodes; j++) {
+     for(i = 0; i < node_count; i++) {
+      for(j = 0; j < node_count; j++) {
         if(config->A[i][j] != 0)
           fprintf(stderr, "A[%d][%d] = %e\n", i, j, config->A[i][j]);
       }
     }
 
     if(DEBUG)
-      for(i = 0; i < config->n_fluid_cells + extra_pressure_nodes; i++)
+      for(i = 0; i < node_count; i++)
         fprintf(stderr, "b[%d] = %e\n", i, config->b[i]);
 
   }
@@ -570,10 +727,120 @@ double flow_rate(microchannel_config_t * config, int cell1_i, int cell1_j, int c
   return (pressure[mapping[cell1_i][cell1_j]] - pressure[mapping[cell2_i][cell2_j]]) * hydroC(config);
 }
 
+static double inlet_network_flow(microchannel_config_t *config, int row,
+                                 int column)
+{
+  double flow = 0.0;
+  if(row > 0 && IS_FLUID_CELL(config, row - 1, column))
+    flow += flow_rate(config, row, column, row - 1, column);
+  if(row < config->num_rows - 1 &&
+     IS_FLUID_CELL(config, row + 1, column))
+    flow += flow_rate(config, row, column, row + 1, column);
+  if(column > 0 && IS_FLUID_CELL(config, row, column - 1))
+    flow += flow_rate(config, row, column, row, column - 1);
+  if(column < config->num_columns - 1 &&
+     IS_FLUID_CELL(config, row, column + 1))
+    flow += flow_rate(config, row, column, row, column + 1);
+  return flow;
+}
+
+static void write_hydraulic_report(FILE *stream,
+                                   microchannel_config_t *config)
+{
+  int branch;
+  fprintf(stream,
+          "HotSpot 7 hydraulic state: network=%s branches=%d "
+          "pump_pressure_pa=%.17g total_flow_m3_s=%.17g "
+          "pump_power_w=%.17g conservation_error_m3_s=%.17g "
+          "pump_curve_residual_pa=%.17g",
+          config->network_file, config->cooling_branch_count,
+          config->solved_pump_pressure, config->total_flow,
+          config->pump_power, config->hydraulic_conservation_error,
+          config->pump_curve_residual);
+  for(branch = 0; branch < config->cooling_branch_count; branch++)
+    fprintf(stream, " branch_%d_flow_m3_s=%.17g", branch,
+            config->branch_flow[branch]);
+  fprintf(stream, "\n");
+}
+
+static void record_hydraulic_operating_point(microchannel_config_t *config)
+{
+  int row, column, branch;
+  double network_flow = 0.0;
+  double valve_flow = 0.0;
+  double branch_network_flow[MAX_COOLING_BRANCHES] = {0.0, 0.0, 0.0, 0.0};
+  const char *report_path;
+  FILE *report;
+
+  for(branch = 0; branch < MAX_COOLING_BRANCHES; branch++)
+    config->branch_flow[branch] = 0.0;
+
+  if(uses_shared_pump(config))
+    config->solved_pump_pressure =
+      config->b[config->n_fluid_cells + config->cooling_branch_count];
+  else if(config->pump_internal_res != 0.0)
+    config->solved_pump_pressure = config->b[config->n_fluid_cells];
+  else
+    config->solved_pump_pressure = config->pumping_pressure;
+
+  for(row = 0; row < config->num_rows; row++) {
+    for(column = 0; column < config->num_columns; column++) {
+      if(IS_INLET_CELL(config, row, column)) {
+        double inlet_flow = inlet_network_flow(config, row, column);
+        network_flow += inlet_flow;
+        if(uses_shared_pump(config)) {
+          branch = config->branch_ids[row][column];
+          branch_network_flow[branch] += inlet_flow;
+        }
+      }
+    }
+  }
+
+  if(uses_shared_pump(config)) {
+    for(branch = 0; branch < config->cooling_branch_count; branch++) {
+      int branch_node = config->n_fluid_cells + branch;
+      config->branch_flow[branch] =
+        (config->solved_pump_pressure - config->b[branch_node]) /
+        config->valve_resistance[branch];
+      valve_flow += config->branch_flow[branch];
+    }
+  }
+
+  config->total_flow = uses_shared_pump(config) ? valve_flow : network_flow;
+  config->hydraulic_conservation_error = 0.0;
+  if(uses_shared_pump(config))
+    for(branch = 0; branch < config->cooling_branch_count; branch++)
+      config->hydraulic_conservation_error +=
+        fabs(config->branch_flow[branch] - branch_network_flow[branch]);
+  config->pump_curve_residual = uses_shared_pump(config) ?
+    config->solved_pump_pressure +
+      config->pump_curve_resistance * config->total_flow -
+      config->pumping_pressure : 0.0;
+  config->pump_power = config->total_flow * config->solved_pump_pressure /
+    config->pump_efficiency;
+
+  write_hydraulic_report(stdout, config);
+  report_path = getenv("HOTSPOT_G7_HYDRAULIC_REPORT");
+  if(report_path && report_path[0]) {
+    report = fopen(report_path, "a");
+    if(!report)
+      fatal("Unable to open HotSpot 7 hydraulic report\n");
+    write_hydraulic_report(report, config);
+    fclose(report);
+  }
+}
+
 // Copy user-defined parameters from one microchannel config to another
 void copy_microchannel(microchannel_config_t *dst, microchannel_config_t *src) {
+  int branch;
   dst->pumping_pressure  = src->pumping_pressure;
   dst->pump_internal_res = src->pump_internal_res;
+  dst->cooling_branch_count = src->cooling_branch_count;
+  for(branch = 0; branch < MAX_COOLING_BRANCHES; branch++)
+    dst->valve_resistance[branch] = src->valve_resistance[branch];
+  dst->pump_curve_resistance = src->pump_curve_resistance;
+  dst->manifold_inlet_resistance = src->manifold_inlet_resistance;
+  dst->pump_efficiency = src->pump_efficiency;
   dst->inlet_temperature = src->inlet_temperature;
   dst->coolant_capac     = src->coolant_capac;
   dst->coolant_res       = src->coolant_res;
@@ -593,8 +860,15 @@ void free_microchannel(microchannel_config_t *config) {
       free(config->cell_types);
     }
 
+    if(config->branch_ids) {
+      for(i = 0; i < config->num_rows; i++)
+        free(config->branch_ids[i]);
+      free(config->branch_ids);
+    }
+
     if(config->A) {
-      for(i = 0; i < config->n_fluid_cells; i++) {
+      int node_count = pressure_node_count(config);
+      for(i = 0; i < node_count; i++) {
         free(config->A[i]);
       }
       free(config->A);
