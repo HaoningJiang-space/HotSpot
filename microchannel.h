@@ -105,6 +105,8 @@ typedef struct microchannel_config_t_st
   // For SuperLU
   double **A;
   double *b;
+  /* Experimental straight-duct mode: positive right-to-left volume flow per row. */
+  double *physical_row_flow;
   int nnz;
 
   // Last solved hydraulic operating point.

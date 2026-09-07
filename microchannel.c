@@ -24,6 +24,7 @@ static int pressure_node_count(const microchannel_config_t *config)
 }
 
 static void record_hydraulic_operating_point(microchannel_config_t *config);
+static void solve_physical_straight_ducts(microchannel_config_t *config);
 
 // default microchannel configuration parameters
 microchannel_config_t default_microchannel_config(void)
@@ -59,6 +60,7 @@ microchannel_config_t default_microchannel_config(void)
   config.mapping           = NULL;
   config.A                 = NULL;
   config.b                 = NULL;
+  config.physical_row_flow = NULL;
   config.nnz               = 0;
   config.total_flow        = 0.0;
   config.solved_pump_pressure = 0.0;
@@ -462,6 +464,12 @@ void microchannel_build_network(microchannel_config_t *config) {
 
   fclose(fp);
 
+  if(getenv("HOTSPOT_G7_PHYSICAL_STRAIGHT_DUCTS")) {
+    if(strcmp(getenv("HOTSPOT_G7_PHYSICAL_STRAIGHT_DUCTS"), "1"))
+      fatal("Physical straight-duct mode accepts only value 1\n");
+    solve_physical_straight_ducts(config);
+    return;
+  }
   printf("Creating pressure circuit...\n");
   build_pressure_matrix(config);
   printf("Solving pressure circuit...\n");
@@ -738,6 +746,16 @@ double flow_rate(microchannel_config_t * config, int cell1_i, int cell1_j, int c
   int **mapping = config->mapping;
   if(abs(cell1_i - cell2_i) + abs(cell1_j - cell2_j) != 1)
     fatal("Hydraulic flow requires adjacent cells\n");
+  if(config->physical_row_flow) {
+    if(cell1_i < 0 || cell2_i < 0 || cell1_j < 0 || cell2_j < 0 ||
+       cell1_i >= config->num_rows || cell2_i >= config->num_rows ||
+       cell1_j >= config->num_columns || cell2_j >= config->num_columns ||
+       !IS_FLUID_CELL(config, cell1_i, cell1_j) ||
+       !IS_FLUID_CELL(config, cell2_i, cell2_j))
+      fatal("Invalid physical-duct flow edge\n");
+    return cell1_i == cell2_i ?
+      (cell1_j - cell2_j) * config->physical_row_flow[cell1_i] : 0.0;
+  }
   return (pressure[mapping[cell1_i][cell1_j]] - pressure[mapping[cell2_i][cell2_j]]) *
     edge_hydro_conductance(config, cell1_i == cell2_i);
 }
@@ -776,6 +794,103 @@ static void write_hydraulic_report(FILE *stream,
     fprintf(stream, " branch_%d_flow_m3_s=%.17g", branch,
             config->branch_flow[branch]);
   fprintf(stream, "\n");
+}
+
+/* Restricted reduced circuit. Contiguous fluid rows form ONE physical duct;
+ * finite-volume subdivision must not create additional channel walls.
+ * Retains the existing HotSpot rectangular-duct resistance approximation.
+ * Port pressure loss uses full face-to-face length, including both half cells.
+ * Assumes cross-section-averaged axial transport, not resolved Poiseuille flow. */
+static void solve_physical_straight_ducts(microchannel_config_t *c)
+{
+  int r, j, begin, branch, k;
+  double sums[MAX_COOLING_BRANCHES] = {0};
+  double branch_g[MAX_COOLING_BRANCHES] = {0};
+  double total_g = 0.;
+  double *duct_g;
+  int *row_branch;
+  FILE *report;
+  const char *path;
+  if(c->cooling_branch_count != 4 || c->num_columns < 3 || c->num_rows < 1 ||
+     c->physical_row_flow || !isfinite(c->pumping_pressure) || c->pumping_pressure < 0.)
+    fatal("Physical ducts require a fresh four-branch configuration\n");
+  duct_g = calloc(c->num_rows, sizeof(double));
+  row_branch = calloc(c->num_rows, sizeof(int));
+  c->physical_row_flow = calloc(c->num_rows, sizeof(double));
+  if(!duct_g || !row_branch || !c->physical_row_flow)
+    fatal("Unable to allocate physical duct state\n");
+  for(r = 0; r < c->num_rows;) {
+    if(c->cell_types[r][0] == SOLID) {
+      for(j = 0; j < c->num_columns; j++)
+        if(c->cell_types[r][j] != SOLID)
+          fatal("Physical duct mode rejects partial channels\n");
+      r++;
+      continue;
+    }
+    begin = r;
+    branch = c->branch_ids[r][c->num_columns - 1];
+    if(branch < 0 || branch >= 4)
+      fatal("Physical duct has invalid branch ID\n");
+    while(r < c->num_rows && c->cell_types[r][0] != SOLID) {
+      if(c->cell_types[r][0] != OUTLET ||
+         c->cell_types[r][c->num_columns - 1] != INLET ||
+         c->branch_ids[r][c->num_columns - 1] != branch)
+        fatal("Physical duct requires right inlet and left outlet with one branch ID\n");
+      for(j = 1; j < c->num_columns - 1; j++)
+        if(c->cell_types[r][j] != FLUID)
+          fatal("Physical duct mode rejects bends or interior ports\n");
+      r++;
+    }
+    {
+      microchannel_config_t duct = *c;
+      double g;
+      duct.cell_width = c->cell_width * c->num_columns;
+      duct.cell_height = c->cell_height * (r - begin);
+      g = edge_hydro_conductance(&duct, TRUE);
+      g = 1. / (1. / g + c->manifold_inlet_resistance);
+      sums[branch] += g;
+      for(k = begin; k < r; k++) {
+        duct_g[k] = g / (r - begin);
+        row_branch[k] = branch;
+      }
+    }
+  }
+  for(branch = 0; branch < 4; branch++) {
+    if(sums[branch] <= 0. || !isfinite(c->valve_resistance[branch]) ||
+       c->valve_resistance[branch] <= 0.)
+      fatal("Physical duct mode needs four connected finite-resistance valves\n");
+    branch_g[branch] = 1. / (c->valve_resistance[branch] + 1. / sums[branch]);
+    total_g += branch_g[branch];
+  }
+  c->solved_pump_pressure = c->pumping_pressure / (1. + c->pump_curve_resistance * total_g);
+  c->total_flow = 0.;
+  for(branch = 0; branch < 4; branch++) {
+    c->branch_flow[branch] = c->solved_pump_pressure * branch_g[branch];
+    c->total_flow += c->branch_flow[branch];
+  }
+  for(r = 0; r < c->num_rows; r++)
+    if(duct_g[r] > 0.)
+      c->physical_row_flow[r] = duct_g[r] * c->branch_flow[row_branch[r]] / sums[row_branch[r]];
+  c->hydraulic_conservation_error = 0.;
+  for(branch = 0; branch < 4; branch++) {
+    double sum = 0.;
+    for(r = 0; r < c->num_rows; r++)
+      if(row_branch[r] == branch) sum += c->physical_row_flow[r];
+    c->hydraulic_conservation_error += fabs(sum - c->branch_flow[branch]);
+  }
+  c->pump_curve_residual = c->solved_pump_pressure + c->pump_curve_resistance * c->total_flow - c->pumping_pressure;
+  c->pump_power = c->total_flow * c->solved_pump_pressure / c->pump_efficiency;
+  printf("Hydraulic model: physical-straight-ducts; full-face length; averaged axial transport\n");
+  write_hydraulic_report(stdout, c);
+  path = getenv("HOTSPOT_G7_HYDRAULIC_REPORT");
+  if(path && *path) {
+    report = fopen(path, "a");
+    if(!report) fatal("Unable to open physical duct report\n");
+    write_hydraulic_report(report, c);
+    fclose(report);
+  }
+  free(duct_g);
+  free(row_branch);
 }
 
 static void record_hydraulic_operating_point(microchannel_config_t *config)
@@ -868,6 +983,7 @@ void copy_microchannel(microchannel_config_t *dst, microchannel_config_t *src) {
 void free_microchannel(microchannel_config_t *config) {
   int i;
   if(config) {
+    free(config->physical_row_flow);
     if(config->cell_types) {
       for(i = 0; i < config->num_rows; i++) {
         free(config->cell_types[i]);

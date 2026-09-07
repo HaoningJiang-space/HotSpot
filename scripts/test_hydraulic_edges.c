@@ -52,5 +52,51 @@ int main(void) {
     free(c.A); free(c.b); free(c.mapping[0]); free(c.mapping);
   }
   puts("PASS: rectangular edges, rotation, square parity, reverse flow");
+  {
+    int refinement;
+    double reference_flow = 0.;
+    for(refinement = 1; refinement <= 3; refinement++) {
+      int row, col;
+      microchannel_config_t *p = malloc(sizeof(*p));
+      *p = default_microchannel_config();
+      strcpy(p->network_file, "synthetic-fixed-duct-test");
+      p->num_rows = 8 * refinement;
+      p->num_columns = 4 * refinement;
+      p->cell_width = .01 / p->num_columns;
+      p->cell_height = .004 / p->num_rows;
+      p->cell_thickness = .0003;
+      p->cooling_branch_count = 4;
+      p->manifold_inlet_resistance = 1e9;
+      p->pump_curve_resistance = 3e10;
+      p->pump_efficiency = .7;
+      p->pumping_pressure = 52000.;
+      p->cell_types = calloc(p->num_rows, sizeof(int *));
+      p->branch_ids = calloc(p->num_rows, sizeof(int *));
+      for(row = 0; row < 4; row++) p->valve_resistance[row] = 5e10;
+      for(row = 0; row < p->num_rows; row++) {
+        p->cell_types[row] = calloc(p->num_columns, sizeof(int));
+        p->branch_ids[row] = calloc(p->num_columns, sizeof(int));
+        if((row / refinement) % 2) {
+          for(col = 0; col < p->num_columns; col++) p->cell_types[row][col] = FLUID;
+          p->cell_types[row][0] = OUTLET;
+          p->cell_types[row][p->num_columns - 1] = INLET;
+          p->branch_ids[row][p->num_columns - 1] = row / (2 * refinement);
+        }
+      }
+      solve_physical_straight_ducts(p);
+      if(refinement == 1) reference_flow = p->total_flow;
+      assert(near(p->total_flow, reference_flow));
+      assert(fabs(p->pump_curve_residual) < 1e-9);
+      assert(p->hydraulic_conservation_error < 1e-18);
+      for(row = refinement; row < 2 * refinement; row++) {
+        double q = flow_rate(p, row, 1, row, 0);
+        assert(near(q * refinement, p->branch_flow[0]));
+        assert(near(q, -flow_rate(p, row, 0, row, 1)));
+        if(row + 1 < 2 * refinement) assert(flow_rate(p, row, 1, row + 1, 1) == 0.);
+      }
+      free_microchannel(p);
+    }
+    puts("PASS: physical duct flow invariant under 1x/2x/3x refinement");
+  }
   return 0;
 }
