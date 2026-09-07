@@ -8,6 +8,10 @@
 #include <strings.h>
 #endif
 #include <math.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <errno.h>
+#endif
 
 #include "temperature_grid.h"
 #include "flp.h"
@@ -6434,6 +6438,85 @@ SuperMatrix build_steady_rhs_vector(grid_model_t *model, grid_model_vector_t *po
   return B;
 }
 
+#ifndef _WIN32
+/* Experimental process-local transport. The inherited socket is private; no
+ * matrix files are read or written. Parent-side solve time and IPC are both
+ * part of native execution. This opt-in path never changes auto admission. */
+static void g7_socket_transfer(int fd, void *buffer, size_t bytes, int sending)
+{
+  char *cursor = buffer;
+  while (bytes) {
+    ssize_t count = sending ? write(fd, cursor, bytes) : read(fd, cursor, bytes);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) fatal("Persistent thermal socket disconnected\n");
+    cursor += count; bytes -= (size_t)count;
+  }
+}
+
+static void g7_persistent_session(grid_model_t *model, grid_model_vector_t *power,
+                                   const char *encoded_fd)
+{
+  char *end;
+  long parsed = strtol(encoded_fd, &end, 10);
+  int fd, l, count = g7_operator_node_count(model), queries = 0;
+  microchannel_config_t *fluid = NULL;
+  double control[5], hydraulic[7], *cap, *work, *state;
+  if (*end || parsed < 3 || parsed > 1048576 || sizeof(int) != 4 ||
+      model->config.model_secondary || !model->config.detailed_3D_used)
+    fatal("Unsupported persistent thermal session\n");
+  fd = (int)parsed;
+  for (l = 0; l < model->n_layers; l++)
+    if (model->layers[l].is_microchannel) {
+      if (fluid) fatal("Persistent session admits one cooling layer\n");
+      fluid = model->layers[l].microchannel_config;
+    }
+  if (!fluid || !fluid->physical_row_flow)
+    fatal("Persistent session requires physical straight ducts\n");
+  if (!model->c_ready) populate_C_model_grid(model, NULL);
+  cap = calloc(count, sizeof(double));
+  work = calloc(count, sizeof(double));
+  state = model->last_steady->cuboid[0][0];
+  if (!cap || !work) fatal("Persistent workspace allocation failed\n");
+  g7_operator_build_capacitance(model, cap);
+  for (;;) {
+    SuperMatrix matrix;
+    NCformat *store;
+    double *rhs, rhs_norm = 0., error = 0.;
+    int header[3], i;
+    g7_socket_transfer(fd, control, sizeof(control), 0);
+    if (control[0] == -1.) break; /* Explicit end-of-trace, not EOF success. */
+    refresh_physical_duct_control(fluid, control[0], control+1);
+    matrix = build_transient_grid_matrix(model);
+    rhs = build_transient_power_vector(model, power);
+    store = matrix.Store;
+    header[0] = 0x47375431; header[1] = count; header[2] = store->nnz;
+    hydraulic[0] = fluid->solved_pump_pressure;
+    hydraulic[1] = fluid->total_flow; hydraulic[2] = fluid->pump_power;
+    for (i = 0; i < 4; i++) hydraulic[3+i] = fluid->branch_flow[i];
+    g7_socket_transfer(fd, header, sizeof(header), 1);
+    g7_socket_transfer(fd, hydraulic, sizeof(hydraulic), 1);
+    g7_socket_transfer(fd, store->colptr, (count+1)*sizeof(int), 1);
+    g7_socket_transfer(fd, store->rowind, store->nnz*sizeof(int), 1);
+    g7_socket_transfer(fd, store->nzval, store->nnz*sizeof(double), 1);
+    g7_socket_transfer(fd, rhs, count*sizeof(double), 1);
+    g7_socket_transfer(fd, state, count*sizeof(double), 0);
+    for (i = 0; i < count; i++)
+      if (!isfinite(state[i])) fatal("Nonfinite persistent solution\n");
+    /* Independent native-equation acceptance, not just parent's CSC residual. */
+    g7_operator_residual(model, power, cap, state, work);
+    for (i = 0; i < count; i++) { error += work[i]*work[i]; rhs_norm += rhs[i]*rhs[i]; }
+    error = sqrt(error)/(rhs_norm ? sqrt(rhs_norm) : 1.);
+    g7_socket_transfer(fd, &error, sizeof(error), 1);
+    Destroy_CompCol_Matrix(&matrix); SUPERLU_FREE(rhs);
+    if (!isfinite(error) || error > 1e-10) fatal("Persistent native residual failed\n");
+    queries++;
+  }
+  if (!queries) fatal("Empty persistent trace\n");
+  free(cap); free(work);
+  g7_write_state_if_requested(model);
+}
+#endif
+
 void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vector_t *temp)
 {
   SuperMatrix A, L, U, B;
@@ -6466,6 +6549,12 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
   else
     dim = nl*nr*nc + EXTRA;
 
+#ifndef _WIN32
+  if (getenv("HOTSPOT_G7_SESSION_FD")) {
+    g7_persistent_session(model, power, getenv("HOTSPOT_G7_SESSION_FD"));
+    return;
+  }
+#endif
   P = build_transient_power_vector(model, power);
   if (auto_solver && g7_operator_max_flow(model) > 1.0e-30) {
     use_superlu = 1;

@@ -126,6 +126,9 @@ int microchannel_config_to_strs(microchannel_config_t *config, str_pair *table, 
 void microchannel_build_network(microchannel_config_t *config);
 void build_pressure_matrix(microchannel_config_t *config);
 double flow_rate(microchannel_config_t *config, int cell1_i, int cell1_j, int cell2_i, int cell2_j);
+/* Refresh only the admitted fixed-geometry four-branch hydraulic state. */
+void refresh_physical_duct_control(microchannel_config_t *config,
+                                   double pressure, const double *valves);
 void copy_microchannel(microchannel_config_t *src, microchannel_config_t *dst);
 void free_microchannel(microchannel_config_t * config);
 

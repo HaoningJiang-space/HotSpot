@@ -920,6 +920,23 @@ static void solve_physical_straight_ducts(microchannel_config_t *c)
   free(row_branch);
 }
 
+void refresh_physical_duct_control(microchannel_config_t *config,
+                                   double pressure, const double *valves)
+{
+  int i;
+  if (!config->physical_row_flow || config->cooling_branch_count != 4 ||
+      config->closed_branch_mask || !isfinite(pressure) || pressure <= 0.)
+    fatal("Persistent control requires admitted open-valve physical ducts\n");
+  for (i = 0; i < 4; i++)
+    if (!isfinite(valves[i]) || valves[i] <= 0.)
+      fatal("Invalid persistent valve resistance\n");
+  config->pumping_pressure = pressure;
+  for (i = 0; i < 4; i++) config->valve_resistance[i] = valves[i];
+  free(config->physical_row_flow);
+  config->physical_row_flow = NULL;
+  solve_physical_straight_ducts(config);
+}
+
 static void record_hydraulic_operating_point(microchannel_config_t *config)
 {
   int row, column, branch;
