@@ -167,14 +167,14 @@ static double g7_operator_flow_diagonal(grid_model_t *model, int layer,
     if (row > 0 && IS_FLUID_CELL(config, row - 1, column))
       coefficient = config->coolant_capac *
         flow_rate(config, row - 1, column, row, column) / 2.0;
-    else if (row + 1 < nr && IS_FLUID_CELL(config, row + 1, column))
-      coefficient = config->coolant_capac *
+    if (row + 1 < nr && IS_FLUID_CELL(config, row + 1, column))
+      coefficient += config->coolant_capac *
         flow_rate(config, row + 1, column, row, column) / 2.0;
-    else if (column > 0 && IS_FLUID_CELL(config, row, column - 1))
-      coefficient = config->coolant_capac *
+    if (column > 0 && IS_FLUID_CELL(config, row, column - 1))
+      coefficient += config->coolant_capac *
         flow_rate(config, row, column - 1, row, column) / 2.0;
-    else if (column + 1 < nc && IS_FLUID_CELL(config, row, column + 1))
-      coefficient = config->coolant_capac *
+    if (column + 1 < nc && IS_FLUID_CELL(config, row, column + 1))
+      coefficient += config->coolant_capac *
         flow_rate(config, row, column + 1, row, column) / 2.0;
   } else if (IS_FLUID_CELL(config, row, column)) {
     if (row > 0 && IS_FLUID_CELL(config, row - 1, column))
@@ -6596,7 +6596,7 @@ SuperMatrix build_transient_grid_matrix(grid_model_t *model)
          if(model->layers[l].is_microchannel) {
            microchannel_config_t *uconf = model->layers[l].microchannel_config;
            double coeff;
-           // For now I'm going to assume that an outlet only has one fluid cell adjacent to it
+           // Sum every adjacent fluid face, including zero-flow transverse faces.
            if(IS_OUTLET_CELL(uconf, i, j)) {
              // Northern fluid cell
              if(i > 0 && IS_FLUID_CELL(uconf, i-1, j)) {
@@ -6606,21 +6606,21 @@ SuperMatrix build_transient_grid_matrix(grid_model_t *model)
              }
 
              // Southern fluid cell
-             else if (i < nr - 1 && IS_FLUID_CELL(uconf, i+1, j)) {
+             if (i < nr - 1 && IS_FLUID_CELL(uconf, i+1, j)) {
                coeff = uconf->coolant_capac * flow_rate(uconf, i+1, j, i, j);
                Js -= coeff / 2.0;
                Jc += coeff / 2.0;
              }
 
              // Western fluid cell
-             else if (j > 0 && IS_FLUID_CELL(uconf, i, j-1)) {
+             if (j > 0 && IS_FLUID_CELL(uconf, i, j-1)) {
                coeff = uconf->coolant_capac * flow_rate(uconf, i, j-1, i, j);
                Jw -= coeff / 2.0;
                Jc += coeff / 2.0;
              }
 
              // Eastern fluid cell
-             else if (j < nc - 1 && IS_FLUID_CELL(uconf, i, j+1)) {
+             if (j < nc - 1 && IS_FLUID_CELL(uconf, i, j+1)) {
                coeff = uconf->coolant_capac * flow_rate(uconf, i, j+1, i, j);
                Je -= coeff / 2.0;
                Jc += coeff / 2.0;
