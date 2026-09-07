@@ -34,6 +34,23 @@ int main(void) {
                 1000*edge_hydro_conductance(&c,1)));
     assert(near(flow_rate(&c,0,0,0,1), -flow_rate(&c,0,1,0,0)));
   }
+  {
+    int cells[] = {INLET, FLUID, OUTLET}; int *types[] = {cells};
+    int k;
+    c = default_microchannel_config();
+    c.num_rows = 1; c.num_columns = 3; c.cell_types = types;
+    c.cell_width = 4e-4; c.cell_height = 2e-4;
+    c.cell_thickness = 1e-4; c.coolant_visc = 1e-3;
+    build_pressure_matrix(&c);
+    assert(near(c.A[1][0], -gx));
+    assert(near(c.A[1][2], -gx));
+    assert(near(c.A[1][1], 2*gx));
+    c.b[0] = 2000; c.b[1] = 1000; c.b[2] = 0;
+    assert(near(flow_rate(&c,0,0,0,1), 1000*gx));
+    assert(near(flow_rate(&c,0,0,0,1), flow_rate(&c,0,1,0,2)));
+    for(k=0;k<3;k++) free(c.A[k]);
+    free(c.A); free(c.b); free(c.mapping[0]); free(c.mapping);
+  }
   puts("PASS: rectangular edges, rotation, square parity, reverse flow");
   return 0;
 }
