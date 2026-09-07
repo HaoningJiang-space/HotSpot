@@ -1958,6 +1958,9 @@ void parse_layer_file(grid_model_t *model, FILE *fp, materials_list_t *materials
           if(strstr(ptr, NETWORK_EXTENSION) && model->use_microchannels) {
             model->layers[i].is_microchannel = TRUE;
 	          model->layers[i].microchannel_config = malloc(sizeof(microchannel_config_t));
+            if(!model->layers[i].microchannel_config)
+              fatal("Unable to allocate microchannel configuration\n");
+            *model->layers[i].microchannel_config = default_microchannel_config();
 
 	          // Copy over user-defined parameters
 	          copy_microchannel(model->layers[i].microchannel_config, model->default_microchannel_config);
