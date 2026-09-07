@@ -14,6 +14,31 @@ static int near(double a, double b) {
 int main(void) {
   microchannel_config_t c = default_microchannel_config();
   double gx, gy;
+  {
+    FILE *report = tmpfile();
+    char buffer[4096], *field;
+    double bank_g[] = {1e-9, 1e-9, 1e-9, 1e-9};
+    double value;
+    assert(report);
+    c.cooling_branch_count = 4;
+    c.solved_pump_pressure = 100.;
+    c.pump_efficiency = .5;
+    c.closed_branch_mask = 1;
+    c.branch_flow[0] = 0.;
+    c.branch_flow[1] = 5e-8;
+    c.valve_resistance[1] = 1e9;
+    write_hydraulic_report(report, &c, bank_g);
+    rewind(report);
+    assert(fgets(buffer, sizeof(buffer), report));
+    field = strstr(buffer, "branch_0_valve_drop_pa=");
+    assert(field && sscanf(field, "branch_0_valve_drop_pa=%lf", &value) == 1 && value == 100.);
+    field = strstr(buffer, "branch_1_pressure_residual_pa=");
+    assert(field && sscanf(field, "branch_1_pressure_residual_pa=%lf", &value) == 1 && fabs(value) < 1e-12);
+    field = strstr(buffer, "branch_1_pump_power_w=");
+    assert(field && sscanf(field, "branch_1_pump_power_w=%lf", &value) == 1 && near(value, 1e-5));
+    fclose(report);
+    c = default_microchannel_config();
+  }
   c.cell_width = 4e-4; c.cell_height = 2e-4;
   c.cell_thickness = 1e-4; c.coolant_visc = 1e-3;
   gx = edge_hydro_conductance(&c, 1);

@@ -789,7 +789,8 @@ static double inlet_network_flow(microchannel_config_t *config, int row,
 }
 
 static void write_hydraulic_report(FILE *stream,
-                                   microchannel_config_t *config)
+                                   microchannel_config_t *config,
+                                   const double *duct_bank_conductance)
 {
   int branch;
   fprintf(stream,
@@ -801,9 +802,22 @@ static void write_hydraulic_report(FILE *stream,
           config->solved_pump_pressure, config->total_flow,
           config->pump_power, config->hydraulic_conservation_error,
           config->pump_curve_residual, config->closed_branch_mask);
-  for(branch = 0; branch < config->cooling_branch_count; branch++)
+  for(branch = 0; branch < config->cooling_branch_count; branch++) {
     fprintf(stream, " branch_%d_flow_m3_s=%.17g", branch,
             config->branch_flow[branch]);
+    if(duct_bank_conductance) {
+      double q = config->branch_flow[branch];
+      double valve_drop = (config->closed_branch_mask & (1 << branch)) ?
+        config->solved_pump_pressure : q * config->valve_resistance[branch];
+      double bank_drop = q / duct_bank_conductance[branch];
+      fprintf(stream,
+              " branch_%d_valve_drop_pa=%.17g branch_%d_duct_bank_drop_pa=%.17g"
+              " branch_%d_pressure_residual_pa=%.17g branch_%d_pump_power_w=%.17g",
+              branch, valve_drop, branch, bank_drop, branch,
+              config->solved_pump_pressure - valve_drop - bank_drop,
+              branch, config->solved_pump_pressure * q / config->pump_efficiency);
+    }
+  }
   fprintf(stream, "\n");
 }
 
@@ -894,12 +908,12 @@ static void solve_physical_straight_ducts(microchannel_config_t *c)
   c->pump_curve_residual = c->solved_pump_pressure + c->pump_curve_resistance * c->total_flow - c->pumping_pressure;
   c->pump_power = c->total_flow * c->solved_pump_pressure / c->pump_efficiency;
   printf("Hydraulic model: physical-straight-ducts; full-face length; averaged axial transport\n");
-  write_hydraulic_report(stdout, c);
+  write_hydraulic_report(stdout, c, sums);
   path = getenv("HOTSPOT_G7_HYDRAULIC_REPORT");
   if(path && *path) {
     report = fopen(path, "a");
     if(!report) fatal("Unable to open physical duct report\n");
-    write_hydraulic_report(report, c);
+    write_hydraulic_report(report, c, sums);
     fclose(report);
   }
   free(duct_g);
@@ -962,13 +976,13 @@ static void record_hydraulic_operating_point(microchannel_config_t *config)
   config->pump_power = config->total_flow * config->solved_pump_pressure /
     config->pump_efficiency;
 
-  write_hydraulic_report(stdout, config);
+  write_hydraulic_report(stdout, config, NULL);
   report_path = getenv("HOTSPOT_G7_HYDRAULIC_REPORT");
   if(report_path && report_path[0]) {
     report = fopen(report_path, "a");
     if(!report)
       fatal("Unable to open HotSpot 7 hydraulic report\n");
-    write_hydraulic_report(report, config);
+    write_hydraulic_report(report, config, NULL);
     fclose(report);
   }
 }
