@@ -508,6 +508,19 @@ int main(int argc, char **argv)
   print_simulation_summary(thermal_config, model);
 #endif
 
+  /* Layer allocation has already built and solved each hydraulic network.
+   * Budget probes need those exact flows, but no thermal circuit or solve. */
+  if (getenv("HOTSPOT_G7_HYDRAULIC_ONLY")) {
+    if (strcmp(getenv("HOTSPOT_G7_HYDRAULIC_ONLY"), "1") ||
+        !use_microchannels || model->type != GRID_MODEL || !do_detailed_3D)
+      fatal("Hydraulic-only mode requires detailed grid microchannels and value 1\n");
+    printf("Hydraulic-only execution complete; thermal circuit not constructed.\n");
+    delete_RC_model(model);
+    free_materials(&materials_list);
+    free_microchannel(microchannel_config);
+    return 0;
+  }
+
   printf("Creating thermal circuit...\n");
   populate_R_model(model, flp);
 
