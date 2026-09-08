@@ -6789,7 +6789,10 @@ SuperMatrix build_transient_grid_matrix(grid_model_t *model)
   int      *cooX, *cooY;
 
   int      i, j, l, m, n, nnz;
-  double   dia_val;
+  /* Sum the stored double conductances before rounding the diagonal once.
+   * Sequential double accumulation leaks constant-temperature modes on
+   * large grids, even though the edge-difference operator cancels exactly. */
+  long double dia_val;
   int      curidx, grididx;
   int      xoffset, yoffset;
   double   Rn, Rs, Rw, Re, Ra, Rb;
