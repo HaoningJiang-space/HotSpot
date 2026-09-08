@@ -6468,8 +6468,9 @@ static void g7_transient_session(grid_model_t *model, grid_model_vector_t *power
   int header[5] = {0x47375432, count, model->rows, model->cols, model->n_layers};
   microchannel_config_t *fluid = NULL;
   diagonal_matrix_t *capacity;
+  grid_model_vector_t *zero_power;
   SuperMatrix matrix;
-  double control[7], previous[5], *rhs = NULL, *base, *input, *work, *scaled;
+  double control[7], previous[5], *rhs = NULL, *base, *input, *work;
   double initial[2] = {model->config.init_temp, model->config.ambient};
   if (*end || parsed < 3 || parsed > 1048576 || sizeof(int) != 4 ||
       sizeof(int_t) != 4 || model->config.model_secondary ||
@@ -6487,11 +6488,12 @@ static void g7_transient_session(grid_model_t *model, grid_model_vector_t *power
     fatal("Transient session requires physical straight ducts\n");
   if (!model->c_ready) populate_C_model_grid(model, NULL);
   capacity = build_diagonal_matrix(model);
+  zero_power = new_grid_model_vector(model);
+  zero_dvector(zero_power->cuboid[0][0], count);
   base = calloc(count, sizeof(double));
   input = calloc(count, sizeof(double));
   work = calloc(count, sizeof(double));
-  scaled = calloc(count, sizeof(double));
-  if (!base || !input || !work || !scaled)
+  if (!base || !input || !work)
     fatal("Transient session allocation failed\n");
   /* Cross-check the BE mass against the independently maintained native
    * derivative scaling, including all package nodes. No zero-capacity inverse. */
@@ -6586,8 +6588,15 @@ static void g7_transient_session(grid_model_t *model, grid_model_vector_t *power
       for (i = 0; i < count; i++)
         if (!isfinite(input[i])) fatal("Nonfinite transient state\n");
       if (command == 2) {
-        g7_operator_matvec(model, power, capacity->vals, rhs, input, work, scaled);
-        for (i = 0; i < count; i++) work[i] += sigma*capacity->vals[i]*input[i];
+        /* Evaluate the linear part without subtracting two affine residuals.
+         * This matters for weakly grounded package-node basis vectors. The
+         * owned model is restored before another request can be processed. */
+        double ambient = model->config.ambient, inlet = fluid->inlet_temperature;
+        model->config.ambient = 0.; fluid->inlet_temperature = 0.;
+        slope_fn_grid(model, input, zero_power, work);
+        model->config.ambient = ambient; fluid->inlet_temperature = inlet;
+        for (i = 0; i < count; i++)
+          work[i] = capacity->vals[i]*(sigma*input[i]-work[i]);
       } else {
         slope_fn_grid(model, input, power, work);
       }
@@ -6599,7 +6608,8 @@ static void g7_transient_session(grid_model_t *model, grid_model_vector_t *power
   if (!ready) fatal("Empty transient session\n");
   Destroy_CompCol_Matrix(&matrix);
   SUPERLU_FREE(rhs); SUPERLU_FREE(capacity->vals); free(capacity);
-  free(base); free(input); free(work); free(scaled);
+  free_grid_model_vector(zero_power);
+  free(base); free(input); free(work);
 }
 
 static void g7_persistent_session(grid_model_t *model, grid_model_vector_t *power,
