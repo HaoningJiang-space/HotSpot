@@ -6453,6 +6453,155 @@ static void g7_socket_transfer(int fd, void *buffer, size_t bytes, int sending)
   }
 }
 
+/* Opt-in transient service. The stored physical operator is never shifted in
+ * place: changing a time step changes sigma only. Commands are int32 on the
+ * private local socket: 0 close, 1 input event, 2 shifted action, 3 derivative.
+ * Event payload: pressure, four valve resistances, left/right source scales.
+ * Sources are scaled before native boundary terms are added. */
+static void g7_transient_session(grid_model_t *model, grid_model_vector_t *power,
+                                 const char *encoded_fd)
+{
+  char *end;
+  long parsed = strtol(encoded_fd, &end, 10);
+  int fd, i, l, command, ready = 0, count = g7_operator_node_count(model);
+  int grid_count = model->n_layers * model->rows * model->cols;
+  int header[5] = {0x47375432, count, model->rows, model->cols, model->n_layers};
+  microchannel_config_t *fluid = NULL;
+  diagonal_matrix_t *capacity;
+  SuperMatrix matrix;
+  double control[7], previous[5], *rhs = NULL, *base, *input, *work, *scaled;
+  double initial[2] = {model->config.init_temp, model->config.ambient};
+  if (*end || parsed < 3 || parsed > 1048576 || sizeof(int) != 4 ||
+      sizeof(int_t) != 4 || model->config.model_secondary ||
+      !model->config.detailed_3D_used ||
+      strcmp(model->config.init_file, NULLFILE) ||
+      !isfinite(initial[0]) || initial[0] <= 0.)
+    fatal("Unsupported transient session model or initial condition\n");
+  fd = (int)parsed;
+  for (l = 0; l < model->n_layers; l++)
+    if (model->layers[l].is_microchannel) {
+      if (fluid) fatal("Transient session admits one cooling layer\n");
+      fluid = model->layers[l].microchannel_config;
+    }
+  if (!fluid || !fluid->physical_row_flow)
+    fatal("Transient session requires physical straight ducts\n");
+  if (!model->c_ready) populate_C_model_grid(model, NULL);
+  capacity = build_diagonal_matrix(model);
+  base = calloc(count, sizeof(double));
+  input = calloc(count, sizeof(double));
+  work = calloc(count, sizeof(double));
+  scaled = calloc(count, sizeof(double));
+  if (!base || !input || !work || !scaled)
+    fatal("Transient session allocation failed\n");
+  /* Cross-check the BE mass against the independently maintained native
+   * derivative scaling, including all package nodes. No zero-capacity inverse. */
+  g7_operator_build_capacitance(model, work);
+  for (i = 0; i < count; i++) {
+    if (!isfinite(capacity->vals[i]) || capacity->vals[i] <= 0. ||
+        capacity->vals[i] != work[i])
+      fatal("Transient mass is invalid or disagrees with native derivative\n");
+    base[i] = power->cuboid[0][0][i];
+  }
+  g7_socket_transfer(fd, header, sizeof(header), 1);
+  g7_socket_transfer(fd, initial, sizeof(initial), 1);
+  g7_socket_transfer(fd, capacity->vals, count*sizeof(double), 1);
+  for (;;) {
+    g7_socket_transfer(fd, &command, sizeof(command), 0);
+    if (command == 0) break;
+    if (command == 1) {
+      NCformat *store;
+      double hydraulic[7];
+      int frame[2];
+      g7_socket_transfer(fd, control, sizeof(control), 0);
+      for (i = 0; i < 7; i++)
+        if (!isfinite(control[i]) || (i < 5 ? control[i] <= 0. : control[i] < 0.))
+          fatal("Invalid transient input event\n");
+      if (!ready || memcmp(control, previous, sizeof(previous))) {
+        if (ready) Destroy_CompCol_Matrix(&matrix);
+        refresh_physical_duct_control(fluid, control[0], control+1);
+        matrix = build_transient_grid_matrix(model);
+        memcpy(previous, control, sizeof(previous));
+      }
+      for (i = 0; i < grid_count; i++)
+        power->cuboid[0][0][i] = base[i] *
+          control[(i % model->cols < model->cols/2) ? 5 : 6];
+      if (rhs) SUPERLU_FREE(rhs);
+      rhs = build_transient_power_vector(model, power);
+      store = matrix.Store;
+      frame[0] = count; frame[1] = store->nnz;
+      hydraulic[0] = fluid->solved_pump_pressure;
+      hydraulic[1] = fluid->total_flow; hydraulic[2] = fluid->pump_power;
+      for (i = 0; i < 4; i++) hydraulic[3+i] = fluid->branch_flow[i];
+      g7_socket_transfer(fd, frame, sizeof(frame), 1);
+      g7_socket_transfer(fd, hydraulic, sizeof(hydraulic), 1);
+      g7_socket_transfer(fd, store->colptr, (count+1)*sizeof(int), 1);
+      g7_socket_transfer(fd, store->rowind, store->nnz*sizeof(int), 1);
+      g7_socket_transfer(fd, store->nzval, store->nnz*sizeof(double), 1);
+      g7_socket_transfer(fd, rhs, count*sizeof(double), 1);
+      /* Physical source excludes ambient and inlet forcing. */
+      zero_dvector(work, count);
+      memcpy(work, power->cuboid[0][0], grid_count*sizeof(double));
+      g7_socket_transfer(fd, work, count*sizeof(double), 1);
+      /* Boundary energy coefficients are read from physical model data,
+       * independently of CSC row/column sums. */
+      {
+        package_RC_t *pk = &model->pack;
+        int boundary, plane = model->rows*model->cols;
+        int sink = model->n_layers - DEFAULT_PACK_LAYERS + LAYER_SINK;
+        zero_dvector(work, count);
+        for (i = sink*plane; i < (sink+1)*plane; i++)
+          work[i] = 1./model->layers[sink].rz;
+        work[grid_count+SINK_C_W] = work[grid_count+SINK_C_E] =
+          1./(pk->r_hs_c_per_x + pk->r_amb_c_per_x);
+        work[grid_count+SINK_C_N] = work[grid_count+SINK_C_S] =
+          1./(pk->r_hs_c_per_y + pk->r_amb_c_per_y);
+        work[grid_count+SINK_W] = work[grid_count+SINK_E] =
+          work[grid_count+SINK_N] = work[grid_count+SINK_S] =
+          1./(pk->r_hs_per + pk->r_amb_per);
+        g7_socket_transfer(fd, work, count*sizeof(double), 1);
+        for (boundary = 0; boundary < 2; boundary++) {
+          zero_dvector(work, count);
+          for (l = 0; l < model->n_layers; l++)
+            if (model->layers[l].is_microchannel)
+              for (i = 0; i < plane; i++) {
+                int row = i/model->cols, col = i%model->cols;
+                if (boundary == 0 && IS_INLET_CELL(fluid, row, col))
+                  work[l*plane+i] = fluid->coolant_capac *
+                    fluid->physical_row_flow[row] * fluid->inlet_temperature;
+                if (boundary == 1 && IS_OUTLET_CELL(fluid, row, col))
+                  work[l*plane+i] = fluid->coolant_capac * fluid->physical_row_flow[row];
+              }
+          g7_socket_transfer(fd, work, count*sizeof(double), 1);
+        }
+      }
+      ready = 1;
+    } else if (command == 2 || command == 3) {
+      double sigma = 0.;
+      if (!ready) fatal("Transient action requires an input event\n");
+      if (command == 2) {
+        g7_socket_transfer(fd, &sigma, sizeof(sigma), 0);
+        if (!isfinite(sigma) || sigma < 0.) fatal("Invalid transient shift\n");
+      }
+      g7_socket_transfer(fd, input, count*sizeof(double), 0);
+      for (i = 0; i < count; i++)
+        if (!isfinite(input[i])) fatal("Nonfinite transient state\n");
+      if (command == 2) {
+        g7_operator_matvec(model, power, capacity->vals, rhs, input, work, scaled);
+        for (i = 0; i < count; i++) work[i] += sigma*capacity->vals[i]*input[i];
+      } else {
+        slope_fn_grid(model, input, power, work);
+      }
+      for (i = 0; i < count; i++)
+        if (!isfinite(work[i])) fatal("Nonfinite transient action\n");
+      g7_socket_transfer(fd, work, count*sizeof(double), 1);
+    } else fatal("Unknown transient session command\n");
+  }
+  if (!ready) fatal("Empty transient session\n");
+  Destroy_CompCol_Matrix(&matrix);
+  SUPERLU_FREE(rhs); SUPERLU_FREE(capacity->vals); free(capacity);
+  free(base); free(input); free(work); free(scaled);
+}
+
 static void g7_persistent_session(grid_model_t *model, grid_model_vector_t *power,
                                    const char *encoded_fd)
 {
@@ -6550,6 +6699,10 @@ void direct_SLU(grid_model_t *model, grid_model_vector_t *power, grid_model_vect
     dim = nl*nr*nc + EXTRA;
 
 #ifndef _WIN32
+  if (getenv("HOTSPOT_G7_TRANSIENT_FD")) {
+    g7_transient_session(model, power, getenv("HOTSPOT_G7_TRANSIENT_FD"));
+    return;
+  }
   if (getenv("HOTSPOT_G7_SESSION_FD")) {
     g7_persistent_session(model, power, getenv("HOTSPOT_G7_SESSION_FD"));
     return;
